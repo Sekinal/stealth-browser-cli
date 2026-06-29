@@ -1,0 +1,34 @@
+version: 2
+
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: America/Mexico_City
+    open-pull-requests-limit: 10
+    groups:
+      playwright-runtime:
+        patterns:
+          - "@playwright/test"
+          - "playwright"
+          - "playwright-core"
+          - "patchright-core"
+      browser-providers:
+        patterns:
+          - "cloakbrowser"
+          - "camoufox-js"
+    commit-message:
+      prefix: deps
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:30"
+      timezone: America/Mexico_City
+    commit-message:
+      prefix: ci
