@@ -27,8 +27,8 @@ function bundledSkillFile() {
 function installedSkillTargets() {
   const cwd = process.cwd();
   return [
-    { dir: path.join(cwd, '.claude', 'skills', 'playwright-cli'), command: 'playwright-cli install --skills' },
-    { dir: path.join(cwd, '.agents', 'skills', 'playwright-cli'), command: 'playwright-cli install --skills=agents' },
+    { dir: path.join(cwd, '.claude', 'skills', 'playwright-cli'), command: 'stealth-browser-cli install --skills' },
+    { dir: path.join(cwd, '.agents', 'skills', 'playwright-cli'), command: 'stealth-browser-cli install --skills=agents' },
   ];
 }
 
@@ -63,7 +63,7 @@ function checkInstalledSkills() {
         continue;
       if (installed !== bundled) {
         process.stderr.write(frame([
-          `The playwright-cli skill at '${path.relative(process.cwd(), target.dir)}'`,
+          `The installed CLI skill at '${path.relative(process.cwd(), target.dir)}'`,
           `does not match the tool version.`,
           ``,
           `Run \`${target.command}\``,

@@ -1,12 +1,12 @@
 {
-  "name": "@playwright/cli",
+  "name": "stealth-browser-cli",
   "version": "0.1.14",
-  "description": "Playwright CLI",
+  "description": "Stealth browser automation CLI with CloakBrowser, Patchright, and Camoufox provider fallbacks",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/microsoft/playwright-cli.git"
+    "url": "git+https://github.com/Sekinal/stealth-browser-cli.git"
   },
-  "homepage": "https://playwright.dev",
+  "homepage": "https://github.com/Sekinal/stealth-browser-cli",
   "engines": {
     "node": ">=20"
   },
@@ -32,6 +32,7 @@
     "language-tags": "2.0.0"
   },
   "bin": {
-    "playwright-cli": "playwright-cli.js"
+    "playwright-cli": "playwright-cli.js",
+    "stealth-browser-cli": "playwright-cli.js"
   }
 }
