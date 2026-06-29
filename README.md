@@ -274,6 +274,13 @@ playwright-cli close                    # close the browser
 playwright-cli delete-data              # delete user data for default session
 ```
 
+By default, this fork opens new sessions with CloakBrowser. If CloakBrowser cannot
+start, it falls back to Patchright's bundled Chromium and then Camoufox. Set
+`PLAYWRIGHT_CLI_BROWSER_PROVIDER=patchright`, `camoufox`, or a comma-separated
+order such as `camoufox,patchright` to override the provider order. Explicit
+`--browser`, `--config`, `PLAYWRIGHT_MCP_BROWSER`, and `PLAYWRIGHT_MCP_CONFIG`
+settings are respected and skip the automatic provider selection.
+
 ### Snapshots
 
 After each command, playwright-cli provides a snapshot of the current browser state.

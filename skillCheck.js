@@ -20,7 +20,7 @@ const fs = require('fs');
 const path = require('path');
 
 function bundledSkillFile() {
-  const programPath = require.resolve('playwright-core/lib/tools/cli-client/program');
+  const programPath = require.resolve('patchright-core/lib/tools/cli-client/program');
   return path.join(path.dirname(programPath), 'skill', 'SKILL.md');
 }
 

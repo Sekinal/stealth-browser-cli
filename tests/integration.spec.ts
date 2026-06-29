@@ -35,6 +35,7 @@ async function runCli(...args: string[]): Promise<CliResult> {
     const childProcess = spawn(process.execPath, [cliPath, ...args], {
       env: {
         ...process.env,
+        PLAYWRIGHT_CLI_BROWSER_PROVIDER: process.env.PLAYWRIGHT_CLI_BROWSER_PROVIDER || 'patchright',
         PLAYWRIGHT_CLI_INSTALLATION_FOR_TEST: test.info().outputPath(),
       },
       cwd: test.info().outputPath(),
@@ -83,4 +84,20 @@ test('warns when installed skill is out of date', async ({}) => {
   expect(await runCli('--help')).toEqual(expect.objectContaining({
     error: expect.stringContaining('does not match the tool version'),
   }));
+});
+
+test('browser provider selection respects explicit config', async ({}) => {
+  const providers = require('../browserProviders');
+
+  expect(providers.resolveProviderOrder(undefined)).toEqual(['cloakbrowser', 'patchright', 'camoufox']);
+  expect(providers.resolveProviderOrder('camoufox,patchright')).toEqual(['camoufox', 'patchright']);
+
+  expect(providers.hasExplicitBrowserConfig(['open', '--browser=firefox'], {})).toBe(true);
+  expect(providers.hasExplicitBrowserConfig(['open', '--config', 'cli.json'], {})).toBe(true);
+  expect(providers.hasExplicitBrowserConfig(['open'], { PLAYWRIGHT_MCP_BROWSER: 'firefox' })).toBe(true);
+  expect(providers.hasExplicitBrowserConfig(['open'], {})).toBe(false);
+
+  expect(providers.createProviderState('open', ['open'], {}).enabled).toBe(true);
+  expect(providers.createProviderState('open', ['open', '--browser=webkit'], {}).enabled).toBe(false);
+  expect(providers.createProviderState('close', ['close'], {}).enabled).toBe(false);
 });

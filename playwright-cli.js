@@ -20,10 +20,12 @@
 const fs = require('fs');
 const path = require('path');
 
-const { program } = require('playwright-core/lib/tools/cli-client/program');
-const coreBundle = require('playwright-core/lib/coreBundle');
+const { program } = require('patchright-core/lib/tools/cli-client/program');
+const sessionModule = require(path.join(path.dirname(require.resolve('patchright-core/package.json')), 'lib/tools/cli-client/session.js'));
+const coreBundle = require('patchright-core/lib/coreBundle');
 const { tools, registry } = coreBundle;
 const { checkInstalledSkills, frame } = require('./skillCheck');
+const { configureBrowserProviderFallbacks } = require('./browserProviders');
 
 const packageJson = require('./package.json');
 
@@ -35,6 +37,7 @@ async function main() {
   const command = process.argv.slice(2).find(arg => !arg.startsWith('-'));
   if (command !== 'install')
     checkInstalledSkills();
+  await configureBrowserProviderFallbacks({ command, sessionModule });
   await notifyAboutUpdate().catch(() => {});
   program({ embedderVersion: packageJson.version });
 }
