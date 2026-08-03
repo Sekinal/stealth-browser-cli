@@ -52,7 +52,8 @@ async function configureBrowserProviderFallbacks(options) {
     while (providerIndex < state.providers.length) {
       const provider = state.providers[providerIndex];
       try {
-        return await originalStartDaemon.apply(this, args);
+        const startDaemon = provider === 'camoufox' ? camoufoxStartDaemon() : originalStartDaemon;
+        return await startDaemon.apply(this, args);
       } catch (error) {
         lastError = error;
         providerIndex++;
@@ -68,6 +69,25 @@ async function configureBrowserProviderFallbacks(options) {
   sessionClass.startDaemon.__browserProviderFallbacks = true;
 
   return { enabled: true, providers: state.providers };
+}
+
+function camoufoxStartDaemon(modules) {
+  let { sessionModule, registryModule } = modules ?? {};
+  if (!sessionModule || !registryModule) {
+    const playwrightRoot = path.dirname(require.resolve('playwright-core/package.json'));
+    sessionModule = require(path.join(playwrightRoot, 'lib/tools/cli-client/session.js'));
+    registryModule = require(path.join(playwrightRoot, 'lib/tools/cli-client/registry.js'));
+  }
+  return async function(clientInfo, cliArgs, mode) {
+    const result = await sessionModule.Session.startDaemon(clientInfo, cliArgs, mode);
+    const daemonClientInfo = registryModule.createClientInfo();
+    if (daemonClientInfo.daemonProfilesDir !== clientInfo.daemonProfilesDir) {
+      const source = path.join(daemonClientInfo.daemonProfilesDir, `${result.sessionName}.session`);
+      const destination = path.join(clientInfo.daemonProfilesDir, `${result.sessionName}.session`);
+      fs.copyFileSync(source, destination);
+    }
+    return result;
+  };
 }
 
 /**
@@ -133,6 +153,10 @@ async function activateFirstAvailableProvider(state, env, stderr, activate = act
  * @param {NodeJS.ProcessEnv} env
  */
 async function activateProvider(state, provider, env) {
+  // Once provider selection is enabled, do not let ambient upstream browser
+  // settings override its generated config inside the daemon.
+  delete env.PLAYWRIGHT_MCP_BROWSER;
+  delete env.PLAYWRIGHT_MCP_EXECUTABLE_PATH;
   env[activeProviderEnvName] = provider;
   env[configEnvName] = await configPathForProvider(state, provider);
 }
@@ -179,16 +203,59 @@ async function configForProvider(provider) {
   }
 
   if (provider === 'camoufox') {
+    await ensureCamoufoxInstalled();
     const { launchOptions } = await import('camoufox-js');
     return {
       browser: {
         browserName: 'firefox',
-        launchOptions: await launchOptions({ headless: true, env: {} }),
+        launchOptions: await camoufoxLaunchOptions(launchOptions),
+        // Camoufox rejects Playwright's newer `isMobile` viewport field.
+        // Let Camoufox's fingerprint configuration own the viewport instead.
+        contextOptions: { viewport: null },
       },
     };
   }
 
   throw new Error(`Provider '${provider}' does not use a generated config.`);
+}
+
+/**
+ * @param {Function} launchOptions
+ */
+async function camoufoxLaunchOptions(launchOptions) {
+  try {
+    return await launchOptions({ headless: true, env: {} });
+  } catch (error) {
+    const message = formatProviderError(error);
+    if (!/better_sqlite3\.node|Could not locate the bindings file/i.test(message))
+      throw error;
+    return await launchOptions({
+      headless: true,
+      env: {},
+      block_webgl: true,
+      i_know_what_im_doing: true,
+    });
+  }
+}
+
+/**
+ * camoufox-js 0.10.x starts its automatic browser download without awaiting
+ * it. Await the package's installer ourselves so the first `open` cannot race
+ * a partially extracted browser.
+ *
+ * @param {{ camoufoxPath: Function, CamoufoxFetcher: new () => { install: Function }} | undefined} pkgman
+ */
+async function ensureCamoufoxInstalled(pkgman) {
+  pkgman ??= await import('camoufox-js/dist/pkgman.js');
+  try {
+    pkgman.camoufoxPath(false);
+    return false;
+  } catch {
+    const fetcher = new pkgman.CamoufoxFetcher();
+    await fetcher.install();
+    pkgman.camoufoxPath(false);
+    return true;
+  }
 }
 
 /**
@@ -246,9 +313,12 @@ function providerVersion(provider) {
 
 module.exports = {
   configureBrowserProviderFallbacks,
+  camoufoxStartDaemon,
+  camoufoxLaunchOptions,
   createProviderState,
   resolveProviderOrder,
   hasExplicitBrowserConfig,
   formatProviderError,
+  ensureCamoufoxInstalled,
   providerVersion,
 };

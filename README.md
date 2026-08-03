@@ -163,7 +163,7 @@ stealth-browser-cli snapshot --inline        # return snapshot content directly
 stealth-browser-cli snapshot <ref>           # snapshot a specific element
 stealth-browser-cli snapshot --depth=N       # limit snapshot depth for efficiency
 stealth-browser-cli eval <func> [ref]        # evaluate javascript expression on page or element
-stealth-browser-cli eval <func> --output=f   # save the complete evaluation result to disk
+stealth-browser-cli eval <func> --output=f   # save the raw evaluation value to an absolute file path
 stealth-browser-cli dialog-accept [prompt]   # accept a dialog
 stealth-browser-cli dialog-dismiss           # dismiss a dialog
 stealth-browser-cli resize <w> <h>           # resize the browser window
@@ -297,21 +297,27 @@ settings are respected and skip the automatic provider selection.
 Every `open` reports the selected provider and installed provider version. Fallback warnings include
 the underlying activation or daemon-launch error. Opening an already-running session restarts it and
 re-evaluates the configured provider order; `list` reports the provider name instead of the generic
-browser channel.
+browser channel. A fresh Camoufox selection waits for its browser download to finish before starting
+the session and uses Playwright's Firefox transport while the other providers retain Patchright.
+An explicit `PLAYWRIGHT_CLI_BROWSER_PROVIDER` takes precedence over conflicting upstream browser
+environment variables.
 
 ### Structured output
 
 Pass `--json` to any command for a deterministic response. Page commands return `ok`, `url`, `title`,
-`result`, and `console`; provider-managed sessions also include the active provider and version.
-Failures use the same schema, include an `error`, and exit nonzero.
+`result`, `console`, and `provider`. `provider` contains the active provider and version for managed
+sessions and is `null` when provider selection was bypassed. Failures use the same schema, include an
+`error`, and exit nonzero.
 
 ```bash
 stealth-browser-cli goto https://example.com --timeout=5 --json
 stealth-browser-cli eval '() => document.title' --json
 ```
 
-Use `eval --output=<file>` (or `--filename=<file>`) when the result is too large for terminal output.
-The complete serialized result is written to the file.
+Use `eval --output=<file>` when the result is too large for terminal output. String results are written
+literally, with real newlines and no JSON quoting; objects and other JSON values retain readable JSON.
+The result link contains the absolute output path. Upstream-compatible `--filename=<file>` remains
+available when a JSON-serialized file is desired.
 
 ### Snapshots
 

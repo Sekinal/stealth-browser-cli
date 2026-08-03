@@ -42,6 +42,7 @@ async function runCliWithOptions(options: { env?: NodeJS.ProcessEnv, cwd?: strin
         ...process.env,
         PLAYWRIGHT_CLI_BROWSER_PROVIDER: process.env.PLAYWRIGHT_CLI_BROWSER_PROVIDER || 'patchright',
         PLAYWRIGHT_CLI_INSTALLATION_FOR_TEST: test.info().outputPath(),
+        PWTEST_DAEMON_SESSION_DIR: path.join(test.info().outputPath(), 'daemon'),
         NO_UPDATE_NOTIFIER: '1',
         ...options.env,
       },
@@ -109,6 +110,84 @@ test('browser provider selection respects explicit config', async ({}) => {
   expect(providers.createProviderState('close', ['close'], {}).enabled).toBe(false);
 });
 
+test('waits for a missing Camoufox browser installation before continuing', async ({}) => {
+  const { ensureCamoufoxInstalled } = require('../browserProviders');
+  let installed = false;
+  let installCompleted = false;
+
+  class CamoufoxFetcher {
+    async install() {
+      await new Promise(resolve => setTimeout(resolve, 10));
+      installed = true;
+      installCompleted = true;
+    }
+  }
+
+  const downloaded = await ensureCamoufoxInstalled({
+    camoufoxPath: () => {
+      if (!installed)
+        throw new Error('Camoufox executable not found');
+      return '/cached/camoufox';
+    },
+    CamoufoxFetcher,
+  });
+  expect(downloaded).toBe(true);
+  expect(installCompleted).toBe(true);
+
+  expect(await ensureCamoufoxInstalled({
+    camoufoxPath: () => '/cached/camoufox',
+    CamoufoxFetcher,
+  })).toBe(false);
+});
+
+test('Camoufox daemon adapter exposes the Playwright session to the CLI registry', async ({}) => {
+  const { camoufoxStartDaemon } = require('../browserProviders');
+  const daemonDir = path.join(test.info().outputPath(), 'cli-daemon');
+  const playwrightDaemonDir = path.join(test.info().outputPath(), 'playwright-daemon');
+  fs.mkdirSync(daemonDir, { recursive: true });
+  fs.mkdirSync(playwrightDaemonDir, { recursive: true });
+
+  const startDaemon = camoufoxStartDaemon({
+    sessionModule: {
+      Session: {
+        startDaemon: async () => {
+          fs.writeFileSync(path.join(playwrightDaemonDir, 'camoufox.session'), '{"name":"camoufox"}');
+          return { pid: 42, sessionName: 'camoufox' };
+        },
+      },
+    },
+    registryModule: {
+      createClientInfo: () => ({ daemonProfilesDir: playwrightDaemonDir }),
+    },
+  });
+
+  expect(await startDaemon({ daemonProfilesDir: daemonDir }, {}, 'open')).toEqual({
+    pid: 42,
+    sessionName: 'camoufox',
+  });
+  expect(fs.readFileSync(path.join(daemonDir, 'camoufox.session'), 'utf8')).toBe('{"name":"camoufox"}');
+});
+
+test('Camoufox disables WebGL sampling when its optional SQLite binding is unavailable', async ({}) => {
+  const { camoufoxLaunchOptions } = require('../browserProviders');
+  const calls: unknown[] = [];
+  const options = await camoufoxLaunchOptions(async (value: unknown) => {
+    calls.push(value);
+    if (calls.length === 1)
+      throw new Error('Could not locate the bindings file: better_sqlite3.node');
+    return { executablePath: '/cached/camoufox', ...value as object };
+  });
+
+  expect(calls).toEqual([
+    { headless: true, env: {} },
+    { headless: true, env: {}, block_webgl: true, i_know_what_im_doing: true },
+  ]);
+  expect(options).toEqual(expect.objectContaining({
+    executablePath: '/cached/camoufox',
+    block_webgl: true,
+  }));
+});
+
 test('does not warn when installed skill only differs in line endings', async ({}) => {
   expect(await runCli('install', '--skills')).toEqual(expect.objectContaining({
     exitCode: 0,
@@ -169,6 +248,29 @@ test('provider fallbacks include activation and launch failure reasons', async (
   expect(launchEnv.PLAYWRIGHT_CLI_ACTIVE_BROWSER_PROVIDER).toBe('patchright');
 });
 
+test('an explicit provider override replaces conflicting upstream browser environment', async ({}) => {
+  const { configureBrowserProviderFallbacks } = require('../browserProviders');
+  const env: NodeJS.ProcessEnv = {
+    PLAYWRIGHT_CLI_BROWSER_PROVIDER: 'patchright',
+    PLAYWRIGHT_MCP_BROWSER: 'chromium',
+    PLAYWRIGHT_MCP_EXECUTABLE_PATH: '/wrong/browser',
+  };
+  class Session {
+    static async startDaemon() {
+      return { pid: 1, sessionName: 'default' };
+    }
+  }
+
+  await configureBrowserProviderFallbacks({
+    command: 'open',
+    env,
+    sessionModule: { Session },
+  });
+  expect(env.PLAYWRIGHT_MCP_BROWSER).toBeUndefined();
+  expect(env.PLAYWRIGHT_MCP_EXECUTABLE_PATH).toBeUndefined();
+  expect(env.PLAYWRIGHT_CLI_ACTIVE_BROWSER_PROVIDER).toBe('patchright');
+});
+
 test('reports active provider, re-evaluates it, and lists the provider name', async ({}) => {
   const firstOpen = await runCli('-s=provider-report', 'open', 'data:text/html,<title>First</title>');
   expect(firstOpen).toEqual(expect.objectContaining({
@@ -222,12 +324,38 @@ test('emits stable structured output with page metadata and provider details', a
 
 test('writes complete eval results with --output', async ({}) => {
   await runCli('-s=eval-output', 'open', 'data:text/html,<title>Output</title>');
-  const outputFile = path.join(test.info().outputPath(), 'evaluation.json');
-  const evaluated = await runCli('-s=eval-output', 'eval', '() => "x".repeat(8192)', `--output=${outputFile}`, '--json');
+  const outputFile = path.join(test.info().outputPath(), 'evaluation result.txt');
+  const expected = 'line1\nline2 with "quotes" and \\ backslash\n' + 'x'.repeat(8192);
+  const evaluated = await runCli(
+      '-s=eval-output',
+      'eval',
+      `() => ${JSON.stringify(expected)}`,
+      `--output=${outputFile}`,
+      '--json');
   expect(evaluated.exitCode).toBe(0);
-  expect(JSON.parse(evaluated.output)).toEqual(expect.objectContaining({ ok: true }));
-  expect(JSON.parse(fs.readFileSync(outputFile, 'utf8'))).toBe('x'.repeat(8192));
+  expect(JSON.parse(evaluated.output)).toEqual(expect.objectContaining({
+    ok: true,
+    result: `- [Evaluation result](${outputFile})`,
+    provider: { name: 'patchright', version: '1.61.1' },
+  }));
+  expect(fs.readFileSync(outputFile, 'utf8')).toBe(expected);
+
+  const objectFile = path.join(test.info().outputPath(), 'evaluation-object.json');
+  await runCli('-s=eval-output', 'eval', '() => ({ answer: 42 })', `--output=${objectFile}`);
+  expect(fs.readFileSync(objectFile, 'utf8')).toBe('{\n  "answer": 42\n}');
   await runCli('-s=eval-output', 'close');
+});
+
+test('structured success payload always has a provider field', async ({}) => {
+  const { successPayload } = require('../cliEnhancements');
+  expect(successPayload(undefined, 'done', [], undefined)).toEqual({
+    ok: true,
+    url: null,
+    title: null,
+    result: 'done',
+    console: [],
+    provider: null,
+  });
 });
 
 test('goto timeout fails quickly with structured navigation status', async ({}) => {

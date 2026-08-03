@@ -49,7 +49,7 @@ playwright-cli uncheck e12
 playwright-cli snapshot
 playwright-cli snapshot --inline
 playwright-cli eval "document.title"
-playwright-cli eval "() => document.body.innerText" --output=page-text.json
+playwright-cli eval "() => document.body.innerText" --output=page-text.txt
 playwright-cli eval "el => el.textContent" e5
 # get element id, class, or any attribute not visible in the snapshot
 playwright-cli eval "el => el.id" e5
@@ -199,8 +199,14 @@ playwright-cli --raw localstorage-get theme
 ```
 
 For deterministic agent output, pass `--json`. Page commands return
-`{ ok, url, title, result, console }`; provider-managed sessions also report the active provider and
-version. Failures preserve the same shape, add `error`, and exit nonzero.
+`{ ok, url, title, result, console, provider }`; provider-managed sessions report the active provider
+and version, while explicitly configured sessions use `null`. Failures preserve the same shape, add
+`error`, and exit nonzero. `eval --output=<file>` writes raw string values without JSON escaping and
+returns an absolute result path; use `--filename=<file>` for upstream JSON serialization.
+
+Camoufox's first open waits for its browser download and uses the compatible Playwright Firefox
+transport. An explicit `PLAYWRIGHT_CLI_BROWSER_PROVIDER` overrides upstream browser environment
+variables for that launch.
 
 ```bash
 playwright-cli list --json

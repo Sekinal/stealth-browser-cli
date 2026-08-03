@@ -58,7 +58,7 @@ function extendHelp(help) {
   if (evaluate) {
     evaluate.flags.output = 'string';
     if (!evaluate.help.includes('--output'))
-      evaluate.help += '\n  --output                    alias for --filename';
+      evaluate.help += '\n  --output                    write the raw evaluation value to a file';
   }
 
   const snapshot = help.commands?.snapshot;
@@ -126,11 +126,16 @@ function patchSession(Session, options) {
 
   const originalRun = Session.prototype.run;
   Session.prototype.run = async function(clientInfo, args, runOptions) {
+    const evalOutputPath = resolveEvalOutputPath(args);
     const preparedArgs = prepareCommandArgs(args);
     try {
-      const result = await originalRun.call(this, clientInfo, preparedArgs, runOptions);
+      let result = await originalRun.call(this, clientInfo, preparedArgs, runOptions);
       if (result.isError)
         process.exitCode = 1;
+      if (!result.isError && evalOutputPath) {
+        rewriteEvalOutput(evalOutputPath);
+        result = { ...result, text: absoluteEvalOutputLink(result.text, evalOutputPath) };
+      }
       if (!runOptions?.json)
         return result;
 
@@ -189,9 +194,14 @@ function patchOutput(outputModule, env) {
     JsonOutput.prototype._emit = function(value) {
       let payload;
       if (value?.result?.ok !== undefined && value.session) {
-        payload = { ...value.result, session: value.session, pid: value.pid };
+        payload = {
+          ...value.result,
+          provider: value.result.provider ?? providerDetails(env) ?? null,
+          session: value.session,
+          pid: value.pid,
+        };
       } else if (value?.ok !== undefined) {
-        payload = value;
+        payload = { ...value, provider: value.provider ?? providerDetails(env) ?? null };
       } else if (value?.isError) {
         payload = failurePayload(value.error);
       } else {
@@ -233,6 +243,48 @@ function prepareCommandArgs(args) {
   }
 
   return prepared;
+}
+
+/**
+ * @param {any} args
+ */
+function resolveEvalOutputPath(args) {
+  if (args?._?.[0] !== 'eval' || typeof args.output !== 'string' || !args.output)
+    return undefined;
+  return path.resolve(process.cwd(), args.output);
+}
+
+/**
+ * Upstream intentionally stores evaluation results as JSON. `--output` is the
+ * stealth CLI's raw-value variant: strings are written literally, while other
+ * JSON-compatible values retain their readable JSON representation.
+ *
+ * @param {string} outputPath
+ */
+function rewriteEvalOutput(outputPath) {
+  const serialized = fs.readFileSync(outputPath, 'utf8');
+  let value;
+  try {
+    value = JSON.parse(serialized);
+  } catch {
+    return;
+  }
+  const raw = typeof value === 'string' ? value : JSON.stringify(value, null, 2) ?? String(value);
+  fs.writeFileSync(outputPath, raw, 'utf8');
+}
+
+/**
+ * @param {unknown} text
+ * @param {string} outputPath
+ */
+function absoluteEvalOutputLink(text, outputPath) {
+  if (typeof text !== 'string')
+    return text;
+  const link = `- [Evaluation result](${outputPath})`;
+  const payload = parseJsonText(text);
+  if (payload && typeof payload === 'object' && typeof payload.result === 'string')
+    return JSON.stringify({ ...payload, result: link });
+  return text.replace(/- \[Evaluation result\]\([^\r\n]*\)/, link);
 }
 
 /**
@@ -325,7 +377,7 @@ function successPayload(page, result, consoleEntries, provider) {
     title: page?.title ?? null,
     result: result ?? null,
     console: consoleEntries,
-    ...(provider ? { provider } : {}),
+    provider: provider ?? null,
   };
 }
 
@@ -442,5 +494,6 @@ module.exports = {
   parseConsoleText,
   parseTimeoutMs,
   prepareCommandArgs,
+  resolveEvalOutputPath,
   successPayload,
 };
