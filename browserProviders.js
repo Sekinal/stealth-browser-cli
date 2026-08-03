@@ -24,6 +24,7 @@ const validProviders = new Set(defaultProviderOrder);
  *   env?: NodeJS.ProcessEnv,
  *   sessionModule: { Session?: { startDaemon?: Function } },
  *   stderr?: NodeJS.WriteStream,
+ *   activateProvider?: typeof activateProvider,
  * }} options
  */
 async function configureBrowserProviderFallbacks(options) {
@@ -43,7 +44,8 @@ async function configureBrowserProviderFallbacks(options) {
     return { enabled: true, providers: state.providers };
 
   const stderr = options.stderr ?? process.stderr;
-  let providerIndex = await activateFirstAvailableProvider(state, env, stderr);
+  const activate = options.activateProvider ?? activateProvider;
+  let providerIndex = await activateFirstAvailableProvider(state, env, stderr, activate);
 
   sessionClass.startDaemon = async function(...args) {
     let lastError;
@@ -57,8 +59,8 @@ async function configureBrowserProviderFallbacks(options) {
         if (providerIndex >= state.providers.length)
           break;
         const nextProvider = state.providers[providerIndex];
-        writeProviderNotice(stderr, `Browser provider '${provider}' failed; falling back to '${nextProvider}'.`);
-        await activateProvider(state, nextProvider, env);
+        writeProviderNotice(stderr, `Browser provider '${provider}' failed (${formatProviderError(error)}); falling back to '${nextProvider}'.`);
+        await activate(state, nextProvider, env);
       }
     }
     throw lastError;
@@ -107,18 +109,19 @@ function resolveProviderOrder(providerOverride) {
  * @param {ReturnType<typeof createProviderState>} state
  * @param {NodeJS.ProcessEnv} env
  * @param {NodeJS.WriteStream} stderr
+ * @param {typeof activateProvider} activate
  */
-async function activateFirstAvailableProvider(state, env, stderr) {
+async function activateFirstAvailableProvider(state, env, stderr, activate = activateProvider) {
   let lastError;
   for (let i = 0; i < state.providers.length; i++) {
     try {
-      await activateProvider(state, state.providers[i], env);
+      await activate(state, state.providers[i], env);
       return i;
     } catch (error) {
       lastError = error;
       const nextProvider = state.providers[i + 1];
       if (nextProvider)
-        writeProviderNotice(stderr, `Browser provider '${state.providers[i]}' is unavailable; falling back to '${nextProvider}'.`);
+        writeProviderNotice(stderr, `Browser provider '${state.providers[i]}' is unavailable (${formatProviderError(error)}); falling back to '${nextProvider}'.`);
     }
   }
   throw lastError;
@@ -221,9 +224,31 @@ function writeProviderNotice(stderr, message) {
   stderr.write(`[playwright-cli] ${message}\n`);
 }
 
+/**
+ * @param {unknown} error
+ */
+function formatProviderError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.replace(/\s+/g, ' ').trim() || 'unknown error';
+}
+
+/**
+ * @param {string} provider
+ */
+function providerVersion(provider) {
+  const packageName = provider === 'patchright' ? 'patchright-core' : provider === 'camoufox' ? 'camoufox-js' : provider;
+  try {
+    return require(`${packageName}/package.json`).version;
+  } catch {
+    return require('./package.json').dependencies[packageName];
+  }
+}
+
 module.exports = {
   configureBrowserProviderFallbacks,
   createProviderState,
   resolveProviderOrder,
   hasExplicitBrowserConfig,
+  formatProviderError,
+  providerVersion,
 };
