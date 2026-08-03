@@ -15,8 +15,8 @@ const activeProviderEnvName = 'PLAYWRIGHT_CLI_ACTIVE_BROWSER_PROVIDER';
 const fallbackEnvName = 'PLAYWRIGHT_CLI_BROWSER_PROVIDER_FALLBACK';
 const configEnvName = 'PLAYWRIGHT_MCP_CONFIG';
 
-const defaultProviderOrder = ['cloakbrowser', 'patchright', 'camoufox'];
-const validProviders = new Set(defaultProviderOrder);
+const defaultProviderOrder = ['cloakbrowser', 'patchright'];
+const validProviders = new Set([...defaultProviderOrder, 'camoufox']);
 
 /**
  * @param {{
@@ -361,14 +361,26 @@ function formatProviderError(error) {
 
 /**
  * @param {string} provider
+ * @param {(packageName: string) => string} [installedVersion]
  */
-function providerVersion(provider) {
+function providerVersion(provider, installedVersion = installedProviderVersion) {
   const packageName = provider === 'patchright' ? 'patchright-core' : provider === 'camoufox' ? 'camoufox-js' : provider;
   try {
-    return require(`${packageName}/package.json`).version;
+    return installedVersion(packageName);
   } catch {
-    return require('./package.json').dependencies[packageName];
+    const packageJson = require('./package.json');
+    const version = packageJson.dependencies?.[packageName] ?? packageJson.optionalDependencies?.[packageName];
+    if (!version)
+      throw new Error(`Unable to determine the installed or declared version of browser provider '${provider}'.`);
+    return version;
   }
+}
+
+/**
+ * @param {string} packageName
+ */
+function installedProviderVersion(packageName) {
+  return require(`${packageName}/package.json`).version;
 }
 
 module.exports = {

@@ -97,7 +97,7 @@ test('warns when installed skill is out of date', async ({}) => {
 test('browser provider selection respects explicit config', async ({}) => {
   const providers = require('../browserProviders');
 
-  expect(providers.resolveProviderOrder(undefined)).toEqual(['cloakbrowser', 'patchright', 'camoufox']);
+  expect(providers.resolveProviderOrder(undefined)).toEqual(['cloakbrowser', 'patchright']);
   expect(providers.resolveProviderOrder('camoufox,patchright')).toEqual(['camoufox', 'patchright']);
 
   expect(providers.hasExplicitBrowserConfig(['open', '--browser=firefox'], {})).toBe(true);
@@ -127,6 +127,13 @@ test('recovers provider identity from browser config when metadata is missing', 
   expect(inferProviderDetails({
     browser: { browserName: 'chromium', launchOptions: { channel: 'chrome' } },
   })).toBeUndefined();
+});
+
+test('reports declared versions when an optional provider package is unavailable', async ({}) => {
+  const { providerVersion } = require('../browserProviders');
+  expect(providerVersion('camoufox', () => {
+    throw new Error('optional package is not installed');
+  })).toBe('0.10.2');
 });
 
 test('waits for a missing Camoufox browser installation before continuing', async ({}) => {
@@ -259,7 +266,9 @@ test('provider fallbacks include activation and launch failure reasons', async (
     reason: 'cloakbrowser: Cloak executable was not found',
   });
 
-  const multiActivationEnv: NodeJS.ProcessEnv = {};
+  const multiActivationEnv: NodeJS.ProcessEnv = {
+    PLAYWRIGHT_CLI_BROWSER_PROVIDER: 'cloakbrowser,patchright,camoufox',
+  };
   await configureBrowserProviderFallbacks({
     command: 'open',
     env: multiActivationEnv,

@@ -207,9 +207,10 @@ and JSON output recover the provider from browser configuration if older sidecar
 `eval --output=<file>` writes raw string values without JSON escaping and returns an absolute result
 path; use `--filename=<file>` for upstream JSON serialization.
 
-Camoufox's first open waits for its browser download and uses the compatible Playwright Firefox
-transport. An explicit `PLAYWRIGHT_CLI_BROWSER_PROVIDER` overrides upstream browser environment
-variables for that launch.
+The default provider order is CloakBrowser then Patchright. Camoufox is opt-in through
+`PLAYWRIGHT_CLI_BROWSER_PROVIDER=camoufox` (or an explicit comma-separated fallback order); its first
+open waits for the browser download and uses the compatible Playwright Firefox transport. An explicit
+provider selection overrides upstream browser environment variables for that launch.
 
 ```bash
 playwright-cli list --json
