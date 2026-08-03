@@ -297,17 +297,31 @@ settings are respected and skip the automatic provider selection.
 Every `open` reports the selected provider and installed provider version. Fallback warnings include
 the underlying activation or daemon-launch error. Opening an already-running session restarts it and
 re-evaluates the configured provider order; `list` reports the provider name instead of the generic
-browser channel. A fresh Camoufox selection waits for its browser download to finish before starting
-the session and uses Playwright's Firefox transport while the other providers retain Patchright.
-An explicit `PLAYWRIGHT_CLI_BROWSER_PROVIDER` takes precedence over conflicting upstream browser
-environment variables.
+browser channel, including for older sessions whose provider sidecar is missing. A fresh Camoufox
+selection waits for its browser download to finish before starting the session and uses Playwright's
+Firefox transport while the other providers retain Patchright. An explicit
+`PLAYWRIGHT_CLI_BROWSER_PROVIDER` takes precedence over conflicting upstream browser environment
+variables.
 
 ### Structured output
 
 Pass `--json` to any command for a deterministic response. Page commands return `ok`, `url`, `title`,
 `result`, `console`, and `provider`. `provider` contains the active provider and version for managed
 sessions and is `null` when provider selection was bypassed. Failures use the same schema, include an
-`error`, and exit nonzero.
+`error`, and exit nonzero. When provider selection falls back, responses also contain a persisted
+`fallback` object with `requested`, `active`, and the underlying `reason`, so later commands retain
+the same provenance.
+
+```json
+{
+  "provider": { "name": "patchright", "version": "1.61.1" },
+  "fallback": {
+    "requested": "cloakbrowser",
+    "active": "patchright",
+    "reason": "cloakbrowser: executable not found"
+  }
+}
+```
 
 ```bash
 stealth-browser-cli goto https://example.com --timeout=5 --json

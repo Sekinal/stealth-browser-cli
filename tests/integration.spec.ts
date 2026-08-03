@@ -110,6 +110,25 @@ test('browser provider selection respects explicit config', async ({}) => {
   expect(providers.createProviderState('close', ['close'], {}).enabled).toBe(false);
 });
 
+test('recovers provider identity from browser config when metadata is missing', async ({}) => {
+  const { inferProviderDetails } = require('../cliEnhancements');
+  expect(inferProviderDetails({
+    browser: { browserName: 'chromium', launchOptions: { channel: 'chrome-for-testing' } },
+  })).toEqual({ name: 'patchright', version: '1.61.1' });
+  expect(inferProviderDetails({
+    browser: { browserName: 'firefox', launchOptions: { executablePath: '/cache/camoufox/camoufox-bin' } },
+  })).toEqual({ name: 'camoufox', version: '0.10.2' });
+  expect(inferProviderDetails({
+    browser: { browserName: 'chromium', launchOptions: { executablePath: '/cache/.cloakbrowser/chrome' } },
+  })).toEqual({ name: 'cloakbrowser', version: '0.5.3' });
+  expect(inferProviderDetails({
+    browser: { browserName: 'chromium', launchOptions: { args: ['--fingerprint={"seed":42}'] } },
+  })).toEqual({ name: 'cloakbrowser', version: '0.5.3' });
+  expect(inferProviderDetails({
+    browser: { browserName: 'chromium', launchOptions: { channel: 'chrome' } },
+  })).toBeUndefined();
+});
+
 test('waits for a missing Camoufox browser installation before continuing', async ({}) => {
   const { ensureCamoufoxInstalled } = require('../browserProviders');
   let installed = false;
@@ -147,6 +166,11 @@ test('Camoufox daemon adapter exposes the Playwright session to the CLI registry
   fs.mkdirSync(daemonDir, { recursive: true });
   fs.mkdirSync(playwrightDaemonDir, { recursive: true });
 
+  const fallback = {
+    requested: 'cloakbrowser',
+    active: 'camoufox',
+    reason: 'cloakbrowser: missing; patchright: failed',
+  };
   const startDaemon = camoufoxStartDaemon({
     sessionModule: {
       Session: {
@@ -159,13 +183,18 @@ test('Camoufox daemon adapter exposes the Playwright session to the CLI registry
     registryModule: {
       createClientInfo: () => ({ daemonProfilesDir: playwrightDaemonDir }),
     },
-  });
+  }, { PLAYWRIGHT_CLI_BROWSER_PROVIDER_FALLBACK: JSON.stringify(fallback) });
 
   expect(await startDaemon({ daemonProfilesDir: daemonDir }, {}, 'open')).toEqual({
     pid: 42,
     sessionName: 'camoufox',
   });
   expect(fs.readFileSync(path.join(daemonDir, 'camoufox.session'), 'utf8')).toBe('{"name":"camoufox"}');
+  expect(JSON.parse(fs.readFileSync(path.join(playwrightDaemonDir, 'camoufox.provider.json'), 'utf8'))).toEqual({
+    provider: 'camoufox',
+    version: '0.10.2',
+    fallback,
+  });
 });
 
 test('Camoufox disables WebGL sampling when its optional SQLite binding is unavailable', async ({}) => {
@@ -202,7 +231,7 @@ test('does not warn when installed skill only differs in line endings', async ({
 });
 
 test('provider fallbacks include activation and launch failure reasons', async ({}) => {
-  const { configureBrowserProviderFallbacks } = require('../browserProviders');
+  const { configureBrowserProviderFallbacks, readProviderFallback } = require('../browserProviders');
 
   const activationEnv: NodeJS.ProcessEnv = {};
   let activationError = '';
@@ -224,6 +253,31 @@ test('provider fallbacks include activation and launch failure reasons', async (
   });
   expect(activationError).toContain("'cloakbrowser' is unavailable (Cloak executable was not found)");
   expect(activationEnv.PLAYWRIGHT_CLI_ACTIVE_BROWSER_PROVIDER).toBe('patchright');
+  expect(readProviderFallback(activationEnv)).toEqual({
+    requested: 'cloakbrowser',
+    active: 'patchright',
+    reason: 'cloakbrowser: Cloak executable was not found',
+  });
+
+  const multiActivationEnv: NodeJS.ProcessEnv = {};
+  await configureBrowserProviderFallbacks({
+    command: 'open',
+    env: multiActivationEnv,
+    sessionModule: { Session: class { static async startDaemon() {} } },
+    stderr: { write: () => {} },
+    activateProvider: async (_state: unknown, provider: string, env: NodeJS.ProcessEnv) => {
+      if (provider === 'cloakbrowser')
+        throw new Error('Cloak is missing');
+      if (provider === 'patchright')
+        throw new Error('Patchright cannot launch');
+      env.PLAYWRIGHT_CLI_ACTIVE_BROWSER_PROVIDER = provider;
+    },
+  });
+  expect(readProviderFallback(multiActivationEnv)).toEqual({
+    requested: 'cloakbrowser',
+    active: 'camoufox',
+    reason: 'cloakbrowser: Cloak is missing; patchright: Patchright cannot launch',
+  });
 
   const launchEnv: NodeJS.ProcessEnv = {};
   let launchError = '';
@@ -246,6 +300,11 @@ test('provider fallbacks include activation and launch failure reasons', async (
   await LaunchSession.startDaemon();
   expect(launchError).toContain("'cloakbrowser' failed (Daemon crashed during launch)");
   expect(launchEnv.PLAYWRIGHT_CLI_ACTIVE_BROWSER_PROVIDER).toBe('patchright');
+  expect(readProviderFallback(launchEnv)).toEqual({
+    requested: 'cloakbrowser',
+    active: 'patchright',
+    reason: 'cloakbrowser: Daemon crashed during launch',
+  });
 });
 
 test('an explicit provider override replaces conflicting upstream browser environment', async ({}) => {
@@ -271,6 +330,52 @@ test('an explicit provider override replaces conflicting upstream browser enviro
   expect(env.PLAYWRIGHT_CLI_ACTIVE_BROWSER_PROVIDER).toBe('patchright');
 });
 
+test('structured output reports and persists provider fallback provenance', async ({}) => {
+  const missingCloak = path.join(test.info().outputPath(), 'missing-cloak');
+  const opened = await runCliWithOptions({
+    env: {
+      PLAYWRIGHT_CLI_BROWSER_PROVIDER: 'cloakbrowser,patchright',
+      CLOAKBROWSER_BINARY_PATH: missingCloak,
+    },
+  }, '-s=fallback-json', 'open', 'data:text/html,<title>Fallback</title>', '--json');
+  expect(opened.exitCode).toBe(0);
+  expect(opened.error).toContain("falling back to 'patchright'");
+  expect(JSON.parse(opened.output)).toEqual(expect.objectContaining({
+    ok: true,
+    provider: { name: 'patchright', version: '1.61.1' },
+    fallback: {
+      requested: 'cloakbrowser',
+      active: 'patchright',
+      reason: expect.stringContaining(missingCloak),
+    },
+  }));
+
+  const evaluated = await runCli('-s=fallback-json', 'eval', '() => document.title', '--json');
+  expect(JSON.parse(evaluated.output)).toEqual(expect.objectContaining({
+    ok: true,
+    provider: { name: 'patchright', version: '1.61.1' },
+    fallback: {
+      requested: 'cloakbrowser',
+      active: 'patchright',
+      reason: expect.stringContaining(missingCloak),
+    },
+  }));
+
+  const failed = await runCli('-s=fallback-json', 'eval', '() => { throw new Error("expected failure") }', '--json');
+  expect(failed.exitCode).toBe(1);
+  expect(JSON.parse(failed.output)).toEqual(expect.objectContaining({
+    ok: false,
+    provider: { name: 'patchright', version: '1.61.1' },
+    fallback: {
+      requested: 'cloakbrowser',
+      active: 'patchright',
+      reason: expect.stringContaining(missingCloak),
+    },
+    error: expect.stringContaining('expected failure'),
+  }));
+  await runCli('-s=fallback-json', 'close');
+});
+
 test('reports active provider, re-evaluates it, and lists the provider name', async ({}) => {
   const firstOpen = await runCli('-s=provider-report', 'open', 'data:text/html,<title>First</title>');
   expect(firstOpen).toEqual(expect.objectContaining({
@@ -278,9 +383,27 @@ test('reports active provider, re-evaluates it, and lists the provider name', as
     exitCode: 0,
   }));
 
+  const daemonRoot = path.join(test.info().outputPath(), 'daemon');
+  const metadataRelativePath = fs.readdirSync(daemonRoot, { recursive: true })
+      .map(String)
+      .find(file => file.endsWith('provider-report.provider.json'));
+  expect(metadataRelativePath).toBeTruthy();
+  fs.unlinkSync(path.join(daemonRoot, metadataRelativePath!));
+
   const list = await runCli('list');
   expect(list.output).toContain('browser-type: patchright');
   expect(list.output).not.toContain('browser-type: chrome-for-testing');
+
+  const listJson = JSON.parse((await runCli('list', '--json')).output);
+  expect(listJson.result.browsers).toEqual(expect.arrayContaining([
+    expect.objectContaining({ name: 'provider-report', browserType: 'patchright' }),
+  ]));
+
+  const inferredJson = await runCli('-s=provider-report', 'eval', '() => document.title', '--json');
+  expect(JSON.parse(inferredJson.output)).toEqual(expect.objectContaining({
+    ok: true,
+    provider: { name: 'patchright', version: '1.61.1' },
+  }));
 
   const secondOpen = await runCli('-s=provider-report', 'open', 'data:text/html,<title>Second</title>');
   expect(secondOpen).toEqual(expect.objectContaining({
@@ -355,6 +478,21 @@ test('structured success payload always has a provider field', async ({}) => {
     result: 'done',
     console: [],
     provider: null,
+  });
+
+  const fallback = {
+    requested: 'cloakbrowser',
+    active: 'patchright',
+    reason: 'cloakbrowser: executable missing',
+  };
+  expect(successPayload(undefined, 'done', [], { name: 'patchright', version: '1.61.1' }, fallback)).toEqual({
+    ok: true,
+    url: null,
+    title: null,
+    result: 'done',
+    console: [],
+    provider: { name: 'patchright', version: '1.61.1' },
+    fallback,
   });
 });
 
