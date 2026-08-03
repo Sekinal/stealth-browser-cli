@@ -2,5 +2,7 @@
 !README.md
 !LICENSE
 !playwright-cli.js
+!browserProviders.js
+!cliEnhancements.js
 !skillCheck.js
 !skills/**

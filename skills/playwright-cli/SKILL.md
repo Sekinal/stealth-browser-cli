@@ -47,7 +47,9 @@ playwright-cli upload ./document.pdf
 playwright-cli check e12
 playwright-cli uncheck e12
 playwright-cli snapshot
+playwright-cli snapshot --inline
 playwright-cli eval "document.title"
+playwright-cli eval "() => document.body.innerText" --output=page-text.json
 playwright-cli eval "el => el.textContent" e5
 # get element id, class, or any attribute not visible in the snapshot
 playwright-cli eval "el => el.id" e5
@@ -196,9 +198,13 @@ TOKEN=$(playwright-cli --raw cookie-get session_id)
 playwright-cli --raw localstorage-get theme
 ```
 
-For structured output wrapping every reply as JSON, pass --json
+For deterministic agent output, pass `--json`. Page commands return
+`{ ok, url, title, result, console }`; provider-managed sessions also report the active provider and
+version. Failures preserve the same shape, add `error`, and exit nonzero.
+
 ```bash
 playwright-cli list --json
+playwright-cli goto https://example.com --timeout=5 --json
 ```
 
 ## Open parameters
@@ -310,6 +316,8 @@ playwright-cli click "getByTestId('submit-button')"
 ```bash
 # create new browser session named "mysession" with persistent profile
 playwright-cli -s=mysession open example.com --persistent
+# after a manual login, save a portable backup of cookies and storage
+playwright-cli -s=mysession state-save auth.json
 # same with manually specified profile directory (use when requested explicitly)
 playwright-cli -s=mysession open example.com --profile=/path/to/profile
 playwright-cli -s=mysession click e6
@@ -325,13 +333,13 @@ playwright-cli kill-all
 
 ## Installation
 
-If global `playwright-cli` command is not available, try a local version via `npx playwright-cli`:
+If global `playwright-cli` command is not available, try a local version via `npx playwright cli`:
 
 ```bash
-npx --no-install playwright-cli --version
+npx --no-install playwright --version
 ```
 
-When local version is available, use `npx playwright-cli` in all commands. Otherwise, install `playwright-cli` as a global command:
+When local version is available, use `npx playwright cli` in all commands. Otherwise, install `playwright-cli` as a global command:
 
 ```bash
 npm install -g @playwright/cli@latest
@@ -396,9 +404,8 @@ playwright-cli show --annotate
 * **Request mocking** [references/request-mocking.md](references/request-mocking.md)
 * **Running Playwright code** [references/running-code.md](references/running-code.md)
 * **Browser session management** [references/session-management.md](references/session-management.md)
-* **Spec-driven testing (plan / generate / heal)** [references/spec-driven-testing.md](references/spec-driven-testing.md)
 * **Storage state (cookies, localStorage)** [references/storage-state.md](references/storage-state.md)
-* **Test generation** [references/test-generation.md](references/test-generation.md)
+* **Test generation (plan / generate / heal)** [references/test-generation.md](references/test-generation.md)
 * **Tracing** [references/tracing.md](references/tracing.md)
 * **Video recording** [references/video-recording.md](references/video-recording.md)
 * **Inspecting element attributes** [references/element-attributes.md](references/element-attributes.md)

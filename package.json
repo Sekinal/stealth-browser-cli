@@ -1,6 +1,6 @@
 {
   "name": "stealth-browser-cli",
-  "version": "0.1.14",
+  "version": "0.1.18",
   "description": "Stealth browser automation CLI with CloakBrowser, Patchright, and Camoufox provider fallbacks",
   "repository": {
     "type": "git",
@@ -22,11 +22,13 @@
     "@types/node": "^25.2.1"
   },
   "dependencies": {
-    "camoufox-js": "0.10.2",
-    "cloakbrowser": "0.4.5",
+    "cloakbrowser": "0.5.3",
     "patchright-core": "1.61.1",
     "playwright": "1.61.1",
     "playwright-core": "1.61.1"
+  },
+  "optionalDependencies": {
+    "camoufox-js": "0.10.2"
   },
   "overrides": {
     "language-tags": "2.0.0"

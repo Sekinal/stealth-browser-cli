@@ -87,6 +87,16 @@ stealth-browser-cli -s=example open https://example.com --persistent
 stealth-browser-cli list
 ```
 
+For login-walled sites, keep a named persistent session so cookies survive browser restarts. After
+finishing a manual login in headed mode, save a portable storage-state backup as well:
+
+```bash
+stealth-browser-cli -s=social open https://example.com/login --headed --persistent
+# complete the login in the browser window, then:
+stealth-browser-cli -s=social state-save auth.json
+# later, reuse the persistent session or restore the backup with state-load auth.json
+```
+
 You can run your coding agent with the `PLAYWRIGHT_CLI_SESSION` environment variable:
 
 ```bash
@@ -132,6 +142,7 @@ From the grid you can also close running sessions or delete data for inactive on
 ```bash
 stealth-browser-cli open [url]               # open browser, optionally navigate to url
 stealth-browser-cli goto <url>               # navigate to a url
+stealth-browser-cli goto <url> --timeout=5   # navigate with an explicit timeout in seconds
 stealth-browser-cli close                    # close the page
 stealth-browser-cli type <text>              # type text into editable element
 stealth-browser-cli click <ref> [button]     # perform click on a web page
@@ -148,9 +159,11 @@ stealth-browser-cli check <ref>              # check a checkbox or radio button
 stealth-browser-cli uncheck <ref>            # uncheck a checkbox or radio button
 stealth-browser-cli snapshot                 # capture page snapshot to obtain element ref
 stealth-browser-cli snapshot --filename=f    # save snapshot to specific file
+stealth-browser-cli snapshot --inline        # return snapshot content directly
 stealth-browser-cli snapshot <ref>           # snapshot a specific element
 stealth-browser-cli snapshot --depth=N       # limit snapshot depth for efficiency
 stealth-browser-cli eval <func> [ref]        # evaluate javascript expression on page or element
+stealth-browser-cli eval <func> --output=f   # save the complete evaluation result to disk
 stealth-browser-cli dialog-accept [prompt]   # accept a dialog
 stealth-browser-cli dialog-dismiss           # dismiss a dialog
 stealth-browser-cli resize <w> <h>           # resize the browser window
@@ -281,6 +294,25 @@ order such as `camoufox,patchright` to override the provider order. Explicit
 `--browser`, `--config`, `PLAYWRIGHT_MCP_BROWSER`, and `PLAYWRIGHT_MCP_CONFIG`
 settings are respected and skip the automatic provider selection.
 
+Every `open` reports the selected provider and installed provider version. Fallback warnings include
+the underlying activation or daemon-launch error. Opening an already-running session restarts it and
+re-evaluates the configured provider order; `list` reports the provider name instead of the generic
+browser channel.
+
+### Structured output
+
+Pass `--json` to any command for a deterministic response. Page commands return `ok`, `url`, `title`,
+`result`, and `console`; provider-managed sessions also include the active provider and version.
+Failures use the same schema, include an `error`, and exit nonzero.
+
+```bash
+stealth-browser-cli goto https://example.com --timeout=5 --json
+stealth-browser-cli eval '() => document.title' --json
+```
+
+Use `eval --output=<file>` (or `--filename=<file>`) when the result is too large for terminal output.
+The complete serialized result is written to the file.
+
 ### Snapshots
 
 After each command, stealth-browser-cli provides a snapshot of the current browser state.
@@ -302,6 +334,9 @@ stealth-browser-cli snapshot
 
 # save to file, use when snapshot is a part of the workflow result
 stealth-browser-cli snapshot --filename=after-click.yaml
+
+# return snapshot content inline (especially useful with --json)
+stealth-browser-cli snapshot --inline --json
 
 # snapshot an element instead of the whole page
 stealth-browser-cli snapshot "#main"
@@ -565,9 +600,8 @@ The installed skill includes detailed reference guides for common tasks:
 * **Request mocking** — intercept and mock network requests
 * **Running Playwright code** — execute arbitrary Playwright scripts
 * **Browser session management** — manage multiple browser sessions
-* **Spec-driven testing (plan / generate / heal)** — drive tests from a written spec
 * **Storage state (cookies, localStorage)** — persist and restore browser state
-* **Test generation** — generate Playwright tests from interactions
+* **Test generation (plan / generate / heal)** — generate Playwright tests from a spec or interactions
 * **Tracing** — record and inspect execution traces
 * **Video recording** — capture browser session videos
 * **Inspecting element attributes** — get element id, class, or any attribute not visible in the snapshot

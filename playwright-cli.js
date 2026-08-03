@@ -21,42 +21,52 @@ const fs = require('fs');
 const path = require('path');
 
 const { program } = require('patchright-core/lib/tools/cli-client/program');
-const sessionModule = require(path.join(path.dirname(require.resolve('patchright-core/package.json')), 'lib/tools/cli-client/session.js'));
+const patchrightRoot = path.dirname(require.resolve('patchright-core/package.json'));
+const sessionModule = require(path.join(patchrightRoot, 'lib/tools/cli-client/session.js'));
+const outputModule = require(path.join(patchrightRoot, 'lib/tools/cli-client/output.js'));
+const help = require(path.join(patchrightRoot, 'lib/tools/cli-client/help.json'));
 const coreBundle = require('patchright-core/lib/coreBundle');
 const { tools, registry } = coreBundle;
 const { checkInstalledSkills, frame } = require('./skillCheck');
 const { configureBrowserProviderFallbacks } = require('./browserProviders');
+const { configureCliEnhancements, failurePayload } = require('./cliEnhancements');
 
 const packageJson = require('./package.json');
 
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
-main();
+main().catch(error => {
+  if (process.argv.includes('--json'))
+    process.stdout.write(JSON.stringify(error?.cliJson ?? failurePayload(error), null, 2) + '\n');
+  else
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+  process.exitCode = 1;
+});
 
 async function main() {
-  const command = process.argv.slice(2).find(arg => !arg.startsWith('-'));
+  const argv = process.argv.slice(2);
+  const command = argv.find(arg => !arg.startsWith('-'));
   if (command !== 'install')
     checkInstalledSkills();
-  await configureBrowserProviderFallbacks({ command, sessionModule });
-  await notifyAboutUpdate().catch(() => {});
-  program({ embedderVersion: packageJson.version });
+  const providerConfig = await configureBrowserProviderFallbacks({ command, sessionModule });
+  configureCliEnhancements({ argv, command, providerConfig, sessionModule, outputModule, help });
+  await notifyAboutUpdate(command).catch(() => {});
+  await program({ embedderVersion: packageJson.version });
 }
 
-async function notifyAboutUpdate() {
+async function notifyAboutUpdate(command) {
   if (process.env.NO_UPDATE_NOTIFIER || process.env.CI)
     return;
 
   const cache = readCache();
   const stale = !cache || (Date.now() - cache.lastCheck) > ONE_DAY_MS;
-  if (!stale)
-    return;
-
-  const latest = await fetchLatestVersion();
+  const latest = stale ? await fetchLatestVersion() : cache.latestVersion;
   if (!latest)
     return;
-  writeCache({ lastCheck: Date.now(), latestVersion: latest });
+  if (stale)
+    writeCache({ lastCheck: Date.now(), latestVersion: latest });
 
-  if (tools.compareSemver(latest, packageJson.version) > 0)
+  if (tools.compareSemver(latest, packageJson.version) > 0 && (stale || command === 'open'))
     printNotice(packageJson.version, latest);
 }
 
