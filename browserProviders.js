@@ -12,10 +12,11 @@ const path = require('path');
 
 const providerEnvName = 'PLAYWRIGHT_CLI_BROWSER_PROVIDER';
 const activeProviderEnvName = 'PLAYWRIGHT_CLI_ACTIVE_BROWSER_PROVIDER';
+const fallbackEnvName = 'PLAYWRIGHT_CLI_BROWSER_PROVIDER_FALLBACK';
 const configEnvName = 'PLAYWRIGHT_MCP_CONFIG';
 
-const defaultProviderOrder = ['cloakbrowser', 'patchright', 'camoufox'];
-const validProviders = new Set(defaultProviderOrder);
+const defaultProviderOrder = ['cloakbrowser'];
+const validProviders = new Set([...defaultProviderOrder, 'patchright', 'camoufox']);
 
 /**
  * @param {{
@@ -45,6 +46,7 @@ async function configureBrowserProviderFallbacks(options) {
 
   const stderr = options.stderr ?? process.stderr;
   const activate = options.activateProvider ?? activateProvider;
+  delete env[fallbackEnvName];
   let providerIndex = await activateFirstAvailableProvider(state, env, stderr, activate);
 
   sessionClass.startDaemon = async function(...args) {
@@ -52,16 +54,38 @@ async function configureBrowserProviderFallbacks(options) {
     while (providerIndex < state.providers.length) {
       const provider = state.providers[providerIndex];
       try {
-        const startDaemon = provider === 'camoufox' ? camoufoxStartDaemon() : originalStartDaemon;
+        const startDaemon = provider === 'camoufox' ? camoufoxStartDaemon(undefined, env) : originalStartDaemon;
         return await startDaemon.apply(this, args);
       } catch (error) {
         lastError = error;
+        const existingFallback = readProviderFallback(env);
+        const failures = [
+          ...(existingFallback?.reason ? [existingFallback.reason] : []),
+          `${provider}: ${formatProviderError(error)}`,
+        ];
         providerIndex++;
-        if (providerIndex >= state.providers.length)
-          break;
+        let activated = false;
         const nextProvider = state.providers[providerIndex];
-        writeProviderNotice(stderr, `Browser provider '${provider}' failed (${formatProviderError(error)}); falling back to '${nextProvider}'.`);
-        await activate(state, nextProvider, env);
+        if (nextProvider)
+          writeProviderNotice(stderr, `Browser provider '${provider}' failed (${formatProviderError(error)}); falling back to '${nextProvider}'.`);
+        while (providerIndex < state.providers.length) {
+          const candidate = state.providers[providerIndex];
+          try {
+            await activate(state, candidate, env);
+            setProviderFallback(env, existingFallback?.requested ?? state.providers[0], candidate, failures);
+            activated = true;
+            break;
+          } catch (activationError) {
+            lastError = activationError;
+            failures.push(`${candidate}: ${formatProviderError(activationError)}`);
+            const followingProvider = state.providers[providerIndex + 1];
+            if (followingProvider)
+              writeProviderNotice(stderr, `Browser provider '${candidate}' is unavailable (${formatProviderError(activationError)}); falling back to '${followingProvider}'.`);
+            providerIndex++;
+          }
+        }
+        if (!activated)
+          break;
       }
     }
     throw lastError;
@@ -71,7 +95,7 @@ async function configureBrowserProviderFallbacks(options) {
   return { enabled: true, providers: state.providers };
 }
 
-function camoufoxStartDaemon(modules) {
+function camoufoxStartDaemon(modules, env = process.env) {
   let { sessionModule, registryModule } = modules ?? {};
   if (!sessionModule || !registryModule) {
     const playwrightRoot = path.dirname(require.resolve('playwright-core/package.json'));
@@ -85,6 +109,15 @@ function camoufoxStartDaemon(modules) {
       const source = path.join(daemonClientInfo.daemonProfilesDir, `${result.sessionName}.session`);
       const destination = path.join(clientInfo.daemonProfilesDir, `${result.sessionName}.session`);
       fs.copyFileSync(source, destination);
+    }
+    const fallback = readProviderFallback(env);
+    try {
+      fs.writeFileSync(path.join(daemonClientInfo.daemonProfilesDir, `${result.sessionName}.provider.json`), JSON.stringify({
+        provider: 'camoufox',
+        version: providerVersion('camoufox'),
+        ...(fallback ? { fallback } : {}),
+      }));
+    } catch {
     }
     return result;
   };
@@ -133,18 +166,45 @@ function resolveProviderOrder(providerOverride) {
  */
 async function activateFirstAvailableProvider(state, env, stderr, activate = activateProvider) {
   let lastError;
+  const failures = [];
   for (let i = 0; i < state.providers.length; i++) {
     try {
       await activate(state, state.providers[i], env);
+      if (failures.length)
+        setProviderFallback(env, state.providers[0], state.providers[i], failures);
       return i;
     } catch (error) {
       lastError = error;
+      failures.push(`${state.providers[i]}: ${formatProviderError(error)}`);
       const nextProvider = state.providers[i + 1];
       if (nextProvider)
         writeProviderNotice(stderr, `Browser provider '${state.providers[i]}' is unavailable (${formatProviderError(error)}); falling back to '${nextProvider}'.`);
     }
   }
   throw lastError;
+}
+
+/**
+ * @param {NodeJS.ProcessEnv} env
+ * @param {string} requested
+ * @param {string} active
+ * @param {string[]} reasons
+ */
+function setProviderFallback(env, requested, active, reasons) {
+  env[fallbackEnvName] = JSON.stringify({ requested, active, reason: reasons.join('; ') });
+}
+
+/**
+ * @param {NodeJS.ProcessEnv} env
+ */
+function readProviderFallback(env) {
+  try {
+    const value = JSON.parse(env[fallbackEnvName] ?? '');
+    if (typeof value.requested === 'string' && typeof value.active === 'string' && typeof value.reason === 'string')
+      return value;
+  } catch {
+  }
+  return undefined;
 }
 
 /**
@@ -301,14 +361,26 @@ function formatProviderError(error) {
 
 /**
  * @param {string} provider
+ * @param {(packageName: string) => string} [installedVersion]
  */
-function providerVersion(provider) {
+function providerVersion(provider, installedVersion = installedProviderVersion) {
   const packageName = provider === 'patchright' ? 'patchright-core' : provider === 'camoufox' ? 'camoufox-js' : provider;
   try {
-    return require(`${packageName}/package.json`).version;
+    return installedVersion(packageName);
   } catch {
-    return require('./package.json').dependencies[packageName];
+    const packageJson = require('./package.json');
+    const version = packageJson.dependencies?.[packageName] ?? packageJson.optionalDependencies?.[packageName];
+    if (!version)
+      throw new Error(`Unable to determine the installed or declared version of browser provider '${provider}'.`);
+    return version;
   }
+}
+
+/**
+ * @param {string} packageName
+ */
+function installedProviderVersion(packageName) {
+  return require(`${packageName}/package.json`).version;
 }
 
 module.exports = {
@@ -321,4 +393,5 @@ module.exports = {
   formatProviderError,
   ensureCamoufoxInstalled,
   providerVersion,
+  readProviderFallback,
 };

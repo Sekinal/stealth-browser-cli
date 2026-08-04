@@ -91,6 +91,7 @@ function patchSession(Session, options) {
       writeProviderMetadata(clientInfo.daemonProfilesDir, result.sessionName, {
         provider,
         version: providerVersion(provider),
+        fallback: fallbackDetails(options.env),
       });
     }
     return result;
@@ -101,9 +102,11 @@ function patchSession(Session, options) {
     const canConnect = await originalCanConnect.apply(this, arguments);
     if (canConnect) {
       const metadata = readProviderMetadata(this._sessionFile?.daemonDir, this.name);
-      if (metadata?.provider && this.config?.browser) {
+      const provider = metadata ? { name: metadata.provider, version: metadata.version } : inferProviderDetails(this.config);
+      this.__stealthProviderDetails = provider;
+      if (provider?.name && this.config?.browser) {
         this.config.browser.launchOptions ??= {};
-        this.config.browser.launchOptions.channel = metadata.provider;
+        this.config.browser.launchOptions.channel = provider.name;
       }
     }
     return canConnect;
@@ -146,7 +149,8 @@ function patchSession(Session, options) {
             upstreamPayload?.error ?? result.text,
             undefined,
             [],
-            providerDetailsForSession(this, options.env));
+            providerDetailsForSession(this, options.env),
+            fallbackDetailsForSession(this, options.env));
         return { ...result, text: JSON.stringify(payload, null, 2) };
       }
 
@@ -156,14 +160,20 @@ function patchSession(Session, options) {
           page,
           normalizeUpstreamResult(upstreamPayload),
           consoleEntries,
-          providerDetailsForSession(this, options.env));
+          providerDetailsForSession(this, options.env),
+          fallbackDetailsForSession(this, options.env));
       return { ...result, text: JSON.stringify(payload, null, 2) };
     } catch (error) {
       if (runOptions?.json) {
         const page = await readPageMetadata(originalRun, this, clientInfo);
         const consoleEntries = await readConsoleEntries(originalRun, this, clientInfo);
         if (error && typeof error === 'object')
-          error.cliJson = failurePayload(error, page, consoleEntries, providerDetailsForSession(this, options.env));
+          error.cliJson = failurePayload(
+              error,
+              page,
+              consoleEntries,
+              providerDetailsForSession(this, options.env),
+              fallbackDetailsForSession(this, options.env));
       }
       throw error;
     }
@@ -194,18 +204,25 @@ function patchOutput(outputModule, env) {
     JsonOutput.prototype._emit = function(value) {
       let payload;
       if (value?.result?.ok !== undefined && value.session) {
+        const fallback = value.result.fallback ?? fallbackDetails(env);
         payload = {
           ...value.result,
           provider: value.result.provider ?? providerDetails(env) ?? null,
+          ...(fallback ? { fallback } : {}),
           session: value.session,
           pid: value.pid,
         };
       } else if (value?.ok !== undefined) {
-        payload = { ...value, provider: value.provider ?? providerDetails(env) ?? null };
+        const fallback = value.fallback ?? fallbackDetails(env);
+        payload = {
+          ...value,
+          provider: value.provider ?? providerDetails(env) ?? null,
+          ...(fallback ? { fallback } : {}),
+        };
       } else if (value?.isError) {
-        payload = failurePayload(value.error);
+        payload = failurePayload(value.error, undefined, [], providerDetails(env), fallbackDetails(env));
       } else {
-        payload = successPayload(undefined, value, [], providerDetails(env));
+        payload = successPayload(undefined, value, [], providerDetails(env), fallbackDetails(env));
       }
       return originalEmit.call(this, payload);
     };
@@ -369,8 +386,9 @@ function parseConsoleText(text) {
  * @param {unknown} result
  * @param {string[]} consoleEntries
  * @param {{ name: string, version: string } | undefined} provider
+ * @param {{ requested: string, active: string, reason: string } | undefined} fallback
  */
-function successPayload(page, result, consoleEntries, provider) {
+function successPayload(page, result, consoleEntries, provider, fallback) {
   return {
     ok: true,
     url: page?.url ?? null,
@@ -378,6 +396,7 @@ function successPayload(page, result, consoleEntries, provider) {
     result: result ?? null,
     console: consoleEntries,
     provider: provider ?? null,
+    ...(fallback ? { fallback } : {}),
   };
 }
 
@@ -386,8 +405,9 @@ function successPayload(page, result, consoleEntries, provider) {
  * @param {{ url: string | null, title: string | null } | undefined} [page]
  * @param {string[]} [consoleEntries]
  * @param {{ name: string, version: string } | undefined} [provider]
+ * @param {{ requested: string, active: string, reason: string } | undefined} [fallback]
  */
-function failurePayload(error, page, consoleEntries = [], provider) {
+function failurePayload(error, page, consoleEntries = [], provider, fallback) {
   return {
     ok: false,
     url: page?.url ?? null,
@@ -396,6 +416,7 @@ function failurePayload(error, page, consoleEntries = [], provider) {
     console: consoleEntries,
     error: errorMessage(error),
     ...(provider ? { provider } : {}),
+    ...(fallback ? { fallback } : {}),
   };
 }
 
@@ -417,8 +438,50 @@ function providerDetailsForSession(session, env) {
   const active = providerDetails(env);
   if (active)
     return active;
+  if (session?.__stealthProviderDetails)
+    return session.__stealthProviderDetails;
   const metadata = readProviderMetadata(session?._sessionFile?.daemonDir, session?.name);
-  return metadata ? { name: metadata.provider, version: metadata.version } : undefined;
+  if (metadata)
+    return { name: metadata.provider, version: metadata.version };
+  return inferProviderDetails(session?.config);
+}
+
+/**
+ * @param {NodeJS.ProcessEnv} env
+ */
+function fallbackDetails(env) {
+  return require('./browserProviders').readProviderFallback(env);
+}
+
+/**
+ * @param {any} session
+ * @param {NodeJS.ProcessEnv} env
+ */
+function fallbackDetailsForSession(session, env) {
+  const active = fallbackDetails(env);
+  if (active)
+    return active;
+  return readProviderMetadata(session?._sessionFile?.daemonDir, session?.name)?.fallback;
+}
+
+/**
+ * Recovers provider identity for sessions created before sidecar metadata was
+ * written, or when a sidecar was lost.
+ *
+ * @param {any} config
+ */
+function inferProviderDetails(config) {
+  const browser = config?.browser;
+  const launchOptions = browser?.launchOptions ?? {};
+  const executablePath = typeof launchOptions.executablePath === 'string' ? launchOptions.executablePath.toLowerCase() : '';
+  const args = Array.isArray(launchOptions.args) ? launchOptions.args : [];
+  if (launchOptions.channel === 'chrome-for-testing')
+    return { name: 'patchright', version: providerVersion('patchright') };
+  if (browser?.browserName === 'firefox' && executablePath.includes('camoufox'))
+    return { name: 'camoufox', version: providerVersion('camoufox') };
+  if (executablePath.includes('cloakbrowser') || args.some(arg => typeof arg === 'string' && arg.startsWith('--fingerprint=')))
+    return { name: 'cloakbrowser', version: providerVersion('cloakbrowser') };
+  return undefined;
 }
 
 /**
@@ -437,17 +500,36 @@ function readProviderMetadata(daemonDir, sessionName) {
     return undefined;
   try {
     const value = JSON.parse(fs.readFileSync(providerMetadataPath(daemonDir, sessionName), 'utf8'));
-    if (typeof value.provider === 'string' && typeof value.version === 'string')
-      return value;
+    if (typeof value.provider === 'string' && typeof value.version === 'string') {
+      const fallback = validateFallbackDetails(value.fallback);
+      return {
+        provider: value.provider,
+        version: value.version,
+        ...(fallback ? { fallback } : {}),
+      };
+    }
   } catch {
   }
   return undefined;
 }
 
 /**
+ * @param {unknown} value
+ */
+function validateFallbackDetails(value) {
+  const fallback = /** @type {any} */ (value);
+  if (fallback && typeof fallback === 'object' &&
+      typeof fallback.requested === 'string' &&
+      typeof fallback.active === 'string' &&
+      typeof fallback.reason === 'string')
+    return { requested: fallback.requested, active: fallback.active, reason: fallback.reason };
+  return undefined;
+}
+
+/**
  * @param {string} daemonDir
  * @param {string} sessionName
- * @param {{ provider: string, version: string }} metadata
+ * @param {{ provider: string, version: string, fallback?: { requested: string, active: string, reason: string } }} metadata
  */
 function writeProviderMetadata(daemonDir, sessionName, metadata) {
   try {
@@ -490,6 +572,7 @@ function firstCommand(argv) {
 module.exports = {
   configureCliEnhancements,
   failurePayload,
+  inferProviderDetails,
   normalizeUpstreamResult,
   parseConsoleText,
   parseTimeoutMs,
