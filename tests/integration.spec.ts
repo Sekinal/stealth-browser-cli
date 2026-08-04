@@ -97,7 +97,7 @@ test('warns when installed skill is out of date', async ({}) => {
 test('browser provider selection respects explicit config', async ({}) => {
   const providers = require('../browserProviders');
 
-  expect(providers.resolveProviderOrder(undefined)).toEqual(['cloakbrowser', 'patchright']);
+  expect(providers.resolveProviderOrder(undefined)).toEqual(['cloakbrowser']);
   expect(providers.resolveProviderOrder('camoufox,patchright')).toEqual(['camoufox', 'patchright']);
 
   expect(providers.hasExplicitBrowserConfig(['open', '--browser=firefox'], {})).toBe(true);
@@ -240,7 +240,9 @@ test('does not warn when installed skill only differs in line endings', async ({
 test('provider fallbacks include activation and launch failure reasons', async ({}) => {
   const { configureBrowserProviderFallbacks, readProviderFallback } = require('../browserProviders');
 
-  const activationEnv: NodeJS.ProcessEnv = {};
+  const activationEnv: NodeJS.ProcessEnv = {
+    PLAYWRIGHT_CLI_BROWSER_PROVIDER: 'cloakbrowser,patchright',
+  };
   let activationError = '';
   class ActivationSession {
     static async startDaemon() {
@@ -288,7 +290,9 @@ test('provider fallbacks include activation and launch failure reasons', async (
     reason: 'cloakbrowser: Cloak is missing; patchright: Patchright cannot launch',
   });
 
-  const launchEnv: NodeJS.ProcessEnv = {};
+  const launchEnv: NodeJS.ProcessEnv = {
+    PLAYWRIGHT_CLI_BROWSER_PROVIDER: 'cloakbrowser,patchright',
+  };
   let launchError = '';
   class LaunchSession {
     static async startDaemon() {

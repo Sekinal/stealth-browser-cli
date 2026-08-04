@@ -15,8 +15,8 @@ const activeProviderEnvName = 'PLAYWRIGHT_CLI_ACTIVE_BROWSER_PROVIDER';
 const fallbackEnvName = 'PLAYWRIGHT_CLI_BROWSER_PROVIDER_FALLBACK';
 const configEnvName = 'PLAYWRIGHT_MCP_CONFIG';
 
-const defaultProviderOrder = ['cloakbrowser', 'patchright'];
-const validProviders = new Set([...defaultProviderOrder, 'camoufox']);
+const defaultProviderOrder = ['cloakbrowser'];
+const validProviders = new Set([...defaultProviderOrder, 'patchright', 'camoufox']);
 
 /**
  * @param {{
