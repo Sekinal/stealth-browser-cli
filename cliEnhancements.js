@@ -154,8 +154,7 @@ function patchSession(Session, options) {
         return { ...result, text: JSON.stringify(payload, null, 2) };
       }
 
-      const page = await readPageMetadata(originalRun, this, clientInfo);
-      const consoleEntries = await readConsoleEntries(originalRun, this, clientInfo);
+      const [page, consoleEntries] = await readSessionContext(originalRun, this, clientInfo);
       const payload = successPayload(
           page,
           normalizeUpstreamResult(upstreamPayload),
@@ -165,8 +164,7 @@ function patchSession(Session, options) {
       return { ...result, text: JSON.stringify(payload, null, 2) };
     } catch (error) {
       if (runOptions?.json) {
-        const page = await readPageMetadata(originalRun, this, clientInfo);
-        const consoleEntries = await readConsoleEntries(originalRun, this, clientInfo);
+        const [page, consoleEntries] = await readSessionContext(originalRun, this, clientInfo);
         if (error && typeof error === 'object')
           error.cliJson = failurePayload(
               error,
@@ -321,6 +319,24 @@ function parseTimeoutMs(value) {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0)
     throw new Error(`Navigation timeout '${value}' is too small; use at least 1ms (for example, --timeout=5).`);
   return timeoutMs;
+}
+
+/**
+ * Every `--json` invocation needs both the page metadata and the console buffer.
+ * The two reads are independent, so issue them together instead of paying two
+ * sequential daemon round-trips on top of the caller's own command. Both helpers
+ * swallow their own failures, so this never rejects.
+ *
+ * @param {Function} originalRun
+ * @param {any} session
+ * @param {any} clientInfo
+ * @returns {Promise<[{ url: string | null, title: string | null } | undefined, string[]]>}
+ */
+function readSessionContext(originalRun, session, clientInfo) {
+  return Promise.all([
+    readPageMetadata(originalRun, session, clientInfo),
+    readConsoleEntries(originalRun, session, clientInfo),
+  ]);
 }
 
 /**
