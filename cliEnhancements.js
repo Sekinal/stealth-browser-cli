@@ -252,6 +252,8 @@ function prepareCommandArgs(args) {
   if (command === 'goto' && prepared.timeout !== undefined) {
     const timeoutMs = parseTimeoutMs(prepared.timeout);
     const url = prepared._[1];
+    if (typeof url !== 'string' || !url)
+      throw new Error('goto requires a URL (for example, goto https://example.com --timeout=5).');
     delete prepared.timeout;
     prepared._ = ['run-code', `async (page) => {
   await page.goto(${JSON.stringify(url)}, { waitUntil: 'domcontentloaded', timeout: ${timeoutMs} });
@@ -313,10 +315,12 @@ function parseTimeoutMs(value) {
   if (!match)
     throw new Error(`Invalid navigation timeout '${value}'. Use seconds (for example, --timeout=5).`);
   const amount = Number(match[1]);
-  const timeoutMs = match[2] === 'ms' ? amount : amount * 1000;
+  // Round before validating: Playwright treats `timeout: 0` as "no timeout", so a
+  // sub-millisecond value must be rejected rather than rounded into an infinite wait.
+  const timeoutMs = Math.round(match[2] === 'ms' ? amount : amount * 1000);
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0)
-    throw new Error('Navigation timeout must be greater than zero.');
-  return Math.round(timeoutMs);
+    throw new Error(`Navigation timeout '${value}' is too small; use at least 1ms (for example, --timeout=5).`);
+  return timeoutMs;
 }
 
 /**
@@ -557,8 +561,27 @@ function stringOrNull(value) {
 /**
  * @param {unknown} error
  */
+/**
+ * Runs on the failure path, so it must never throw: `JSON.stringify` raises on
+ * circular structures and on BigInt, which would replace the real diagnostic
+ * with an unrelated TypeError.
+ *
+ * @param {unknown} error
+ */
+function serializeUnknownError(error) {
+  try {
+    return JSON.stringify(error) ?? String(error);
+  } catch {
+    try {
+      return String(error);
+    } catch {
+      return 'Unknown error';
+    }
+  }
+}
+
 function errorMessage(error) {
-  const message = error instanceof Error ? error.message : typeof error === 'string' ? error : JSON.stringify(error) ?? String(error);
+  const message = error instanceof Error ? error.message : typeof error === 'string' ? error : serializeUnknownError(error);
   return message.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '');
 }
 

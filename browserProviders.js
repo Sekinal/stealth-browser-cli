@@ -139,9 +139,25 @@ function createProviderState(command, argv, env) {
     enabled: providers.length > 0,
     providers,
     originalConfig: env[configEnvName],
-    configDir: fs.mkdtempSync(path.join(os.tmpdir(), 'playwright-cli-browser-')),
+    configDir: createConfigDir(),
     configPaths: new Map(),
   };
+}
+
+/**
+ * Generated provider configs are scratch state for a single run, and they embed
+ * the resolved launch options. Remove the directory on exit instead of leaving
+ * one behind per invocation.
+ */
+function createConfigDir() {
+  const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'playwright-cli-browser-'));
+  process.once('exit', () => {
+    try {
+      fs.rmSync(configDir, { recursive: true, force: true });
+    } catch {
+    }
+  });
+  return configDir;
 }
 
 /**
