@@ -73,7 +73,7 @@ function extendHelp(help) {
 
   if (!help.commands.fetch) {
     help.commands.fetch = {
-      flags: { method: 'string', data: 'string', header: 'string' },
+      flags: { method: 'string', data: 'string', header: 'string', timeout: 'string' },
       args: ['url'],
       raw: true,
       help: [
@@ -81,6 +81,7 @@ function extendHelp(help) {
         '  --method=GET|POST|PUT|PATCH|DELETE|HEAD  HTTP method (default GET)',
         '  --data=<body>                            request body (POST/PUT/PATCH)',
         '  --header="Key: Value"                    request header (comma-separated)',
+        '  --timeout=<seconds>                      request timeout (default: no timeout)',
       ].join('\n'),
     };
   }
@@ -349,12 +350,15 @@ function prepareCommandArgs(args) {
       throw new Error(`Unsupported fetch method '${prepared.method}'. Expected one of: GET, POST, PUT, PATCH, DELETE, HEAD.`);
     const data = prepared.data;
     const headerArg = prepared.header;
+    const timeoutMs = prepared.timeout !== undefined ? parseTimeoutMs(prepared.timeout) : undefined;
     delete prepared.method;
     delete prepared.data;
     delete prepared.header;
+    delete prepared.timeout;
     const requestOptions = [
       data !== undefined ? `data: ${JSON.stringify(data)}` : '',
       headerArg !== undefined ? `headers: ${JSON.stringify(parseHeaderArg(headerArg))}` : '',
+      timeoutMs !== undefined ? `timeout: ${timeoutMs}` : '',
     ].filter(Boolean).join(', ');
     prepared._ = ['run-code', `async (page) => {
   const url = ${JSON.stringify(url)};
