@@ -369,19 +369,33 @@ function prepareCommandArgs(args) {
     return { ...res, url, redirected: false, failed: res.status >= 400 };
   }
   const response = await page.request.${method.toLowerCase()}(url${requestOptions ? ', { ' + requestOptions + ' }' : ''});
-  const body = await response.text();
-  let json = null;
-  try { json = JSON.parse(body); } catch (_) {}
   const status = response.status();
   const finalUrl = response.url();
   const redirected = url !== finalUrl;
+  const headers = {};
+  for (const h of response.headersArray())
+    headers[h.name.toLowerCase()] = h.value;
+  const contentType = headers['content-type'] ?? '';
+  const isBinary = /octet-stream|image\\/|application\\/pdf|application\\/zip|application\\/gzip|audio\\/|video\\/|font\\//.test(contentType);
+  let body;
+  let binary = false;
+  if (isBinary) {
+    const buf = await response.body();
+    body = buf.toString('base64');
+    binary = true;
+  } else {
+    body = await response.text();
+  }
+  let json = null;
+  if (!binary) { try { json = JSON.parse(body); } catch (_) {} }
   return {
     status,
     statusText: response.statusText(),
     url: finalUrl,
     redirected,
-    headers: response.headers(),
+    headers,
     body,
+    ...(binary ? { binary: true } : {}),
     ...(json !== null ? { json } : {}),
     failed: status >= 400,
   };

@@ -605,6 +605,36 @@ test('fetch supports POST with data and reports redirects', async ({}) => {
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
 });
+
+test('fetch returns base64 for binary responses without corruption', async ({}) => {
+  const crypto = require('crypto');
+  const server = http.createServer((req, res) => {
+    const buf = crypto.randomBytes(1024);
+    res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': buf.length });
+    res.end(buf);
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string')
+    throw new Error('Expected a TCP server address');
+
+  try {
+    await runCli('-s=fetch-binary-test', 'open', 'data:text/html,<title>B</title>');
+    const result = await runCli('-s=fetch-binary-test', 'fetch', `http://127.0.0.1:${address.port}/`, '--json');
+    const payload = JSON.parse(result.output);
+    expect(payload.result.binary).toBe(true);
+    const decoded = Buffer.from(payload.result.body, 'base64');
+    expect(decoded.length).toBe(1024);
+    expect(payload.result.headers['content-type']).toBe('application/octet-stream');
+    await runCli('-s=fetch-binary-test', 'close');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
 test('fetch without URL reports missing argument', async ({}) => {
   const { prepareCommandArgs } = require('../cliEnhancements');
   expect(() => prepareCommandArgs({ _: ['fetch'] })).toThrow(/fetch requires a URL/);
