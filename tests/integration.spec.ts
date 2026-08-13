@@ -635,6 +635,48 @@ test('fetch returns base64 for binary responses without corruption', async ({}) 
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
 });
+
+test('fetch detects anti-bot challenge types from status and body', async ({}) => {
+  const server = http.createServer((req, res) => {
+    if (req.url === '/datadome') {
+      res.writeHead(403, { 'content-type': 'text/html' });
+      res.end('<html><body>Please enable JS and disable any ad blocker</body></html>');
+      return;
+    }
+    if (req.url === '/akamai') {
+      res.writeHead(403, { 'content-type': 'text/html' });
+      res.end('<html><title>Access Denied</title><body>You don\'t have permission to access</body></html>');
+      return;
+    }
+    res.writeHead(403, { 'content-type': 'text/plain' });
+    res.end('forbidden');
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string')
+    throw new Error('Expected a TCP server address');
+
+  try {
+    await runCli('-s=fetch-challenge-test', 'open', 'data:text/html,<title>CH</title>');
+    const base = `http://127.0.0.1:${address.port}`;
+
+    const datadome = await runCli('-s=fetch-challenge-test', 'fetch', `${base}/datadome`, '--json');
+    expect(JSON.parse(datadome.output).result.challenge).toEqual({ type: 'datadome', blocked: true });
+
+    const akamai = await runCli('-s=fetch-challenge-test', 'fetch', `${base}/akamai`, '--json');
+    expect(JSON.parse(akamai.output).result.challenge).toEqual({ type: 'blocked', blocked: true });
+
+    const plain = await runCli('-s=fetch-challenge-test', 'fetch', `${base}/plain`, '--json');
+    expect(JSON.parse(plain.output).result.challenge).toEqual({ type: '403', blocked: true });
+    await runCli('-s=fetch-challenge-test', 'close');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
 test('fetch without URL reports missing argument', async ({}) => {
   const { prepareCommandArgs } = require('../cliEnhancements');
   expect(() => prepareCommandArgs({ _: ['fetch'] })).toThrow(/fetch requires a URL/);

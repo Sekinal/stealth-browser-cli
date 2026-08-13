@@ -185,6 +185,11 @@ function patchSession(Session, options) {
       const [page, consoleEntries] = await readSessionContext(originalRun, this, clientInfo);
       const normalizedResult = normalizeCommandResult(args._?.[0], normalizeUpstreamResult(upstreamPayload));
       const cmd = args._?.[0];
+      if (cmd === 'fetch' && normalizedResult && typeof normalizedResult === 'object' && !Array.isArray(normalizedResult)) {
+        const fetchChallenge = detectChallengeFromText(null, typeof normalizedResult.body === 'string' ? normalizedResult.body : '', typeof normalizedResult.status === 'number' ? normalizedResult.status : null);
+        if (fetchChallenge.blocked)
+          normalizedResult.challenge = fetchChallenge;
+      }
       if (cmd === 'fetch' && normalizedResult && typeof normalizedResult === 'object' && normalizedResult.failed) {
         const payload = {
           ...successPayload(page, null, consoleEntries, providerDetailsForSession(this, options.env), fallbackDetailsForSession(this, options.env), proxyDetails(options.env)),
@@ -312,7 +317,9 @@ function prepareCommandArgs(args) {
       return { type: 'cloudflare', blocked: true };
     if (lower.includes('performing security verification') || lower.includes('ray id'))
       return { type: 'cloudflare', blocked: true };
-    if (lower.includes('access denied') || lower.includes('you have been blocked') || lower.includes('your access has been'))
+    if (lower.includes('please enable js and disable any ad blocker') || lower.includes('datadome'))
+      return { type: 'datadome', blocked: true };
+    if (lower.includes('access denied') || lower.includes('you have been blocked') || lower.includes('your access has been') || lower.includes("you don't have permission"))
       return { type: 'blocked', blocked: true };
     if (lower.includes('captcha') || lower.includes('select all squares') || lower.includes('i am not a robot'))
       return { type: 'captcha', blocked: true };
@@ -745,22 +752,22 @@ function parseConsoleText(text) {
   return text.split(/\r?\n/).map(line => line.trim()).filter(line => line && !/^Total messages:/i.test(line));
 }
 
-/**
- * Detect anti-bot challenge signals from page title and body text.
- * @param {string | null} title
- * @param {string} bodyText
- * @returns {{ type: string, blocked: boolean }}
- */
-function detectChallengeFromText(title, bodyText) {
+function detectChallengeFromText(title, bodyText, status) {
   const lower = `${title ?? ''} ${bodyText ?? ''}`.toLowerCase();
   if (lower.includes('just a moment') || lower.includes('checking your browser') || lower.includes('enable javascript'))
     return { type: 'cloudflare', blocked: true };
   if (lower.includes('performing security verification') || lower.includes('ray id'))
     return { type: 'cloudflare', blocked: true };
-  if (lower.includes('access denied') || lower.includes('you have been blocked') || lower.includes('your access has been'))
+  if (lower.includes('please enable js and disable any ad blocker') || lower.includes('datadome'))
+    return { type: 'datadome', blocked: true };
+  if (lower.includes('access denied') || lower.includes('you have been blocked') || lower.includes('your access has been') || lower.includes("you don't have permission"))
     return { type: 'blocked', blocked: true };
   if (lower.includes('captcha') || lower.includes('select all squares') || lower.includes('i am not a robot'))
     return { type: 'captcha', blocked: true };
+  if (status === 403)
+    return { type: '403', blocked: true };
+  if (status === 429)
+    return { type: 'rate-limit', blocked: true };
   return { type: 'none', blocked: false };
 }
 
