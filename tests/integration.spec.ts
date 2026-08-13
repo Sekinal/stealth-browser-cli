@@ -447,6 +447,10 @@ test('emits stable structured output with page metadata and provider details', a
     result: { answer: 42, text: 'Hello' },
     console: [],
     provider: { name: 'patchright', version: '1.61.1' },
+    challenge: { type: 'none', blocked: false },
+    bodyLength: 5,
+    emptyBody: false,
+    webdriver: false,
   });
 
   const snapshot = await runCli('-s=json-output', 'snapshot', '--inline', '--json');
@@ -480,6 +484,130 @@ test('writes complete eval results with --output', async ({}) => {
   await runCli('-s=eval-output', 'eval', '() => ({ answer: 42 })', `--output=${objectFile}`);
   expect(fs.readFileSync(objectFile, 'utf8')).toBe('{\n  "answer": 42\n}');
   await runCli('-s=eval-output', 'close');
+});
+
+test('--raw eval unwraps JSON-encoded string results', async ({}) => {
+  await runCli('-s=raw-eval', 'open', 'data:text/html,<title>Raw</title>');
+  // Without --raw, JSON.stringify returns a quoted string (double-encoded)
+  const withoutRaw = await runCli('-s=raw-eval', 'eval', 'JSON.stringify({a:1})', '--json');
+  const withoutPayload = JSON.parse(withoutRaw.output);
+  expect(withoutPayload.result).toBe('{"a":1}');
+
+  // With --raw, the string result is unwrapped (no extra quotes)
+  const rawStr = await runCli('-s=raw-eval', '--raw', 'eval', 'JSON.stringify({a:1})');
+  expect(rawStr.output.trim()).toBe('{"a":1}');
+
+  // Object results are unaffected by --raw unwrapping (they aren't strings)
+  const rawObj = await runCli('-s=raw-eval', '--raw', 'eval', '({a:1})');
+  expect(rawObj.output.trim()).toBe('{\n  "a": 1\n}');
+
+  // Number results are unaffected
+  const rawNum = await runCli('-s=raw-eval', '--raw', 'eval', '42');
+  expect(rawNum.output.trim()).toBe('42');
+  await runCli('-s=raw-eval', 'close');
+});
+
+test('fetch command returns structured HTTP response', async ({}) => {
+  await runCli('-s=fetch-test', 'open', 'data:text/html,<title>Fetch</title>');
+  const result = await runCli('-s=fetch-test', 'fetch', 'data:text/html,<p>Hello</p>', '--json');
+  const payload = JSON.parse(result.output);
+  expect(result.exitCode).toBe(0);
+  expect(payload.ok).toBe(true);
+  expect(payload.result.status).toBe(200);
+  expect(payload.result.body).toBe('<p>Hello</p>');
+  expect(payload.result.headers).toEqual(expect.objectContaining({ 'content-type': 'text/html' }));
+  await runCli('-s=fetch-test', 'close');
+});
+
+test('fetch --raw returns just the response body', async ({}) => {
+  await runCli('-s=fetch-raw-test', 'open', 'data:text/html,<title>RawFetch</title>');
+  const result = await runCli('-s=fetch-raw-test', '--raw', 'fetch', 'data:text/html,<p>BodyOnly</p>');
+  expect(result.output.trim()).toBe('<p>BodyOnly</p>');
+  await runCli('-s=fetch-raw-test', 'close');
+});
+
+
+test('fetch reports HTTP 4xx/5xx as failure while preserving the body', async ({}) => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(404, { 'content-type': 'text/plain' });
+    res.end('not found');
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string')
+    throw new Error('Expected a TCP server address');
+
+  try {
+    await runCli('-s=fetch-404-test', 'open', 'data:text/html,<title>F</title>');
+    const result = await runCli('-s=fetch-404-test', 'fetch', `http://127.0.0.1:${address.port}/missing`, '--json');
+    const payload = JSON.parse(result.output);
+    expect(payload.ok).toBe(false);
+    expect(payload.error).toBe('HTTP 404 Not Found');
+    expect(payload.result.status).toBe(404);
+    expect(payload.result.body).toBe('not found');
+    expect(payload.result.failed).toBe(true);
+    await runCli('-s=fetch-404-test', 'close');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('fetch supports POST with data and reports redirects', async ({}) => {
+  const server = http.createServer((req, res) => {
+    if (req.url === '/redirect') {
+      res.writeHead(302, { location: '/target' });
+      res.end();
+      return;
+    }
+    if (req.url === '/target') {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('landed');
+      return;
+    }
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ method: req.method, body }));
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string')
+    throw new Error('Expected a TCP server address');
+
+  try {
+    await runCli('-s=fetch-post-test', 'open', 'data:text/html,<title>FP</title>');
+    const base = `http://127.0.0.1:${address.port}`;
+
+    const post = await runCli('-s=fetch-post-test', 'fetch', `${base}/echo`, '--method=POST', '--data={"x":1}', '--json');
+    const postPayload = JSON.parse(post.output);
+    expect(postPayload.ok).toBe(true);
+    expect(postPayload.result.json.method).toBe('POST');
+    expect(postPayload.result.json.body).toBe('{"x":1}');
+
+    const redirect = await runCli('-s=fetch-post-test', 'fetch', `${base}/redirect`, '--json');
+    const redirectPayload = JSON.parse(redirect.output);
+    expect(redirectPayload.result.status).toBe(200);
+    expect(redirectPayload.result.redirected).toBe(true);
+    expect(redirectPayload.result.url).toBe(`${base}/target`);
+    expect(redirectPayload.result.body).toBe('landed');
+    await runCli('-s=fetch-post-test', 'close');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+test('fetch without URL reports missing argument', async ({}) => {
+  const { prepareCommandArgs } = require('../cliEnhancements');
+  expect(() => prepareCommandArgs({ _: ['fetch'] })).toThrow(/fetch requires a URL/);
 });
 
 test('structured success payload always has a provider field', async ({}) => {
@@ -578,6 +706,107 @@ test('goto --timeout without a URL reports the missing argument', async ({}) => 
   expect(prepared._[1]).not.toContain('goto(undefined');
 });
 
+test('goto --wait-until without a URL reports the missing argument', async ({}) => {
+  const { prepareCommandArgs } = require('../cliEnhancements');
+  expect(() => prepareCommandArgs({ _: ['goto'], 'wait-until': 'load' }))
+      .toThrow(/goto requires a URL/);
+});
+
+test('invalid --wait-until value is rejected', async ({}) => {
+  const { prepareCommandArgs } = require('../cliEnhancements');
+  expect(() => prepareCommandArgs({ _: ['goto', 'https://example.com'], 'wait-until': 'never' }))
+      .toThrow(/Invalid --wait-until/);
+  expect(() => prepareCommandArgs({ _: ['goto', 'https://example.com'], 'wait-until': 'load' }))
+      .not.toThrow();
+});
+
+test('goto --wait-until generates a run-code snippet with the right strategy', async ({}) => {
+  const { prepareCommandArgs } = require('../cliEnhancements');
+  const prepared = prepareCommandArgs({ _: ['goto', 'https://example.com'], 'wait-until': 'networkidle2' });
+  expect(prepared._[0]).toBe('run-code');
+  expect(prepared._[1]).toContain("waitUntil: 'networkidle2'");
+  expect(prepared._[1]).toContain('navigation');
+  expect(prepared._[1]).toContain('url: finalUrl');
+  expect(prepared._[1]).toContain('status');
+  expect(prepared._[1]).toContain('redirected');
+  expect(prepared._[1]).toContain('challenge');
+  expect(prepared._[1]).toContain('bodyLength');
+  expect(prepared._[1]).toContain('emptyBody');
+});
+
+test('goto without flags is not intercepted', async ({}) => {
+  const { prepareCommandArgs } = require('../cliEnhancements');
+  const prepared = prepareCommandArgs({ _: ['goto', 'https://example.com'] });
+  expect(prepared._[0]).toBe('goto');
+});
+
+test('goto --timeout returns full navigation result with redirect detection', async ({}) => {
+  await runCli('-s=goto-result', 'open', 'data:text/html,<title>Start</title>');
+  const nav = await runCli('-s=goto-result', 'goto', 'data:text/html,<title>Target</title>', '--timeout=5', '--json');
+  const payload = JSON.parse(nav.output);
+  expect(nav.exitCode).toBe(0);
+  expect(payload.ok).toBe(true);
+  // The result from the evaluated snippet
+  expect(payload.result.navigation).toBe('succeeded');
+  expect(payload.result.url).toContain('data:text/html');
+  expect(payload.result.title).toBe('Target');
+  expect(payload.result.status === null || typeof payload.result.status === 'number').toBe(true);
+  expect(payload.result.redirected).toBe(false);
+  await runCli('-s=goto-result', 'close');
+});
+
+test('goto --timeout and --wait-until can be combined', async ({}) => {
+  await runCli('-s=goto-combined', 'open', 'data:text/html,<title>Before</title>');
+  const nav = await runCli('-s=goto-combined', 'goto', 'data:text/html,<title>After</title>', '--timeout=5', '--wait-until=load', '--json');
+  const payload = JSON.parse(nav.output);
+  expect(nav.exitCode).toBe(0);
+  expect(payload.ok).toBe(true);
+  expect(payload.result.navigation).toBe('succeeded');
+  expect(payload.result.title).toBe('After');
+  await runCli('-s=goto-combined', 'close');
+});
+
+
+test('parseTabList structures tab-list text output', async ({}) => {
+  // We can't import parseTabList directly (it's not exported), so test via --json
+  await runCli('-s=parse-tabs', 'open', 'data:text/html,<title>First</title>');
+  await runCli('-s=parse-tabs', 'tab-new', 'data:text/html,<title>Second</title>');
+  const result = await runCli('-s=parse-tabs', 'tab-list', '--json');
+  const payload = JSON.parse(result.output);
+  expect(payload.ok).toBe(true);
+  expect(payload.result.tabs).toEqual([
+    { index: 0, current: false, title: 'First', url: 'data:text/html,<title>First</title>' },
+    { index: 1, current: true, title: 'Second', url: 'data:text/html,<title>Second</title>' },
+  ]);
+  await runCli('-s=parse-tabs', 'close');
+});
+
+test('parseConsoleOutput structures console text output', async ({}) => {
+  await runCli('-s=parse-console', 'open', 'data:text/html,<title>C</title>');
+  // Empty console
+  const empty = await runCli('-s=parse-console', 'console', '--json');
+  const emptyPayload = JSON.parse(empty.output);
+  expect(emptyPayload.result).toEqual({ messages: [], summary: { total: 0, errors: 0, warnings: 0 } });
+  await runCli('-s=parse-console', 'close');
+});
+
+test('parseRequestsList structures requests text output', async ({}) => {
+  await runCli('-s=parse-reqs', 'open', 'data:text/html,<title>R</title>');
+  const result = await runCli('-s=parse-reqs', 'requests', '--json');
+  const payload = JSON.parse(result.output);
+  expect(payload.ok).toBe(true);
+  expect(payload.result.requests).toEqual([]);
+  await runCli('-s=parse-reqs', 'close');
+});
+
+test('normalizeCommandResult passes through non-string results unchanged', async ({}) => {
+  // Non-text commands (eval, snapshot, fetch) should return their structured result as-is
+  await runCli('-s=pass-through', 'open', 'data:text/html,<title>PT</title>');
+  const result = await runCli('-s=pass-through', 'eval', '() => ({ x: 1 })', '--json');
+  const payload = JSON.parse(result.output);
+  expect(payload.result).toEqual({ x: 1 });
+  await runCli('-s=pass-through', 'close');
+});
 test('failure payloads survive errors that cannot be serialized', async ({}) => {
   const { failurePayload } = require('../cliEnhancements');
   const circular: any = { a: 1 };
@@ -601,4 +830,73 @@ test('generated provider config directories are removed on exit', async ({}) => 
   const configDir = execFileSync(process.execPath, ['-e', probe], { encoding: 'utf8' }).trim();
   expect(configDir).toContain('playwright-cli-browser-');
   expect(fs.existsSync(configDir)).toBe(false);
+});
+
+test('challenge detection flags Cloudflare-style pages', async ({}) => {
+  const { detectChallengeFromText } = require('../cliEnhancements');
+  // detectChallengeFromText is not exported; test via the payload path instead
+  await runCli('-s=challenge-test', 'open', 'data:text/html,<title>Just a moment...</title><p>Checking your browser before accessing</p>');
+  const result = await runCli('-s=challenge-test', 'eval', '() => document.title', '--json');
+  const payload = JSON.parse(result.output);
+  expect(payload.challenge).toEqual({ type: 'cloudflare', blocked: true });
+  expect(payload.bodyLength).toBeGreaterThan(0);
+  expect(payload.emptyBody).toBe(false);
+  expect(payload.webdriver).toBe(false);
+  await runCli('-s=challenge-test', 'close');
+});
+
+test('empty body is reported with emptyBody flag', async ({}) => {
+  await runCli('-s=empty-test', 'open', 'data:text/html,');
+  const result = await runCli('-s=empty-test', 'eval', '() => document.body.innerText', '--json');
+  const payload = JSON.parse(result.output);
+  expect(payload.bodyLength).toBe(0);
+  expect(payload.emptyBody).toBe(true);
+  await runCli('-s=empty-test', 'close');
+});
+
+test('cleanup command removes accumulated artifacts', async ({}) => {
+  const outputDir = path.join(process.cwd(), '.playwright-cli');
+  const probe = `
+    const fs = require('fs');
+    const path = require('path');
+    const dir = path.join(process.cwd(), '.playwright-cli');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'page-test-old.yml'), '');
+    fs.writeFileSync(path.join(dir, 'console-test-old.log'), '');
+  `;
+  execFileSync(process.execPath, ['-e', probe]);
+  const result = execFileSync(process.execPath, [path.join(__dirname, '../playwright-cli.js'), 'cleanup', '--all', '--json'], { encoding: 'utf8' });
+  const payload = JSON.parse(result);
+  expect(payload.removed).toBeGreaterThanOrEqual(2);
+  expect(fs.existsSync(path.join(outputDir, 'page-test-old.yml'))).toBe(false);
+  expect(fs.existsSync(path.join(outputDir, 'console-test-old.log'))).toBe(false);
+});
+
+test('host-resolver-rules flag is extracted for DNS override', async ({}) => {
+  const providers = require('../browserProviders');
+  const state = providers.createProviderState('open', ['open', '--host-resolver-rules=MAP example.com 1.2.3.4'], {});
+  // Only enabled when provider selection is active; use resolveProviderOrder directly
+  const { resolveProviderOrder, flagValue } = providers;
+  expect(resolveProviderOrder('patchright')).toEqual(['patchright']);
+  // flagValue is internal; verify via a state probe
+  const probe = `
+    const providers = require(${JSON.stringify(path.join(__dirname, '../browserProviders.js'))});
+    const state = providers.createProviderState('open', ['open', '--host-resolver-rules=MAP example.com 1.2.3.4'], {});
+    process.stdout.write(JSON.stringify({ rules: state.hostResolverRules }));
+  `;
+  const out = execFileSync(process.execPath, ['-e', probe], { encoding: 'utf8' }).trim();
+  expect(JSON.parse(out)).toEqual({ rules: 'MAP example.com 1.2.3.4' });
+});
+
+test('request-headers and response-headers --json return structured headers', async ({}) => {
+  await runCli('-s=headers-test', 'open', 'https://httpbin.org/get');
+  const sleep = Promise.withResolvers<void>();
+  setTimeout(() => sleep.resolve(), 2000);
+  await sleep.promise;
+  const responseHeaders = await runCli('-s=headers-test', 'response-headers', '1', '--json');
+  const payload = JSON.parse(responseHeaders.output);
+  expect(payload.ok).toBe(true);
+  expect(typeof payload.result.headers).toBe('object');
+  expect(payload.result.headers).toEqual(expect.objectContaining({ 'content-type': 'application/json' }));
+  await runCli('-s=headers-test', 'close');
 });
