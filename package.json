@@ -1,7 +1,7 @@
 {
   "name": "stealth-browser-cli",
   "version": "0.1.20",
-  "description": "Stealth browser automation CLI with CloakBrowser, Patchright, and Camoufox provider fallbacks",
+  "description": "Stealth browser automation CLI on CloakBrowser, with opt-in Patchright and Camoufox provider fallbacks",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Sekinal/stealth-browser-cli.git"

@@ -17,7 +17,7 @@
 import fs from 'fs';
 import http from 'http';
 import path from 'path';
-import { spawn } from 'child_process';
+import { execFileSync, spawn } from 'child_process';
 import { test, expect } from '@playwright/test';
 
 type CliResult = {
@@ -557,4 +557,48 @@ test('invalid navigation timeout returns the structured error contract', async (
     error: "Invalid navigation timeout 'soon'. Use seconds (for example, --timeout=5).",
   });
   await runCli('-s=invalid-timeout', 'close');
+});
+
+test('sub-millisecond navigation timeouts are rejected instead of disabling the timeout', async ({}) => {
+  const { parseTimeoutMs } = require('../cliEnhancements');
+  // Playwright reads `timeout: 0` as "no timeout", so rounding a tiny value down
+  // to zero would turn the most aggressive request into an indefinite wait.
+  expect(() => parseTimeoutMs('0.0001')).toThrow(/too small/);
+  expect(() => parseTimeoutMs('0.4ms')).toThrow(/too small/);
+  expect(parseTimeoutMs('1ms')).toBe(1);
+  expect(parseTimeoutMs('5')).toBe(5000);
+});
+
+test('goto --timeout without a URL reports the missing argument', async ({}) => {
+  const { prepareCommandArgs } = require('../cliEnhancements');
+  expect(() => prepareCommandArgs({ _: ['goto'], timeout: '5' }))
+      .toThrow(/goto requires a URL/);
+  const prepared = prepareCommandArgs({ _: ['goto', 'https://example.com'], timeout: '5' });
+  expect(prepared._[1]).toContain('"https://example.com"');
+  expect(prepared._[1]).not.toContain('goto(undefined');
+});
+
+test('failure payloads survive errors that cannot be serialized', async ({}) => {
+  const { failurePayload } = require('../cliEnhancements');
+  const circular: any = { a: 1 };
+  circular.self = circular;
+  expect(() => failurePayload(circular)).not.toThrow();
+  expect(failurePayload(circular)).toEqual(expect.objectContaining({
+    ok: false,
+    error: expect.any(String),
+  }));
+
+  const bigint = { size: BigInt(1) };
+  expect(() => failurePayload(bigint)).not.toThrow();
+});
+
+test('generated provider config directories are removed on exit', async ({}) => {
+  const probe = `
+    const providers = require(${JSON.stringify(path.join(__dirname, '../browserProviders.js'))});
+    const state = providers.createProviderState('open', ['open'], {});
+    process.stdout.write(state.configDir);
+  `;
+  const configDir = execFileSync(process.execPath, ['-e', probe], { encoding: 'utf8' }).trim();
+  expect(configDir).toContain('playwright-cli-browser-');
+  expect(fs.existsSync(configDir)).toBe(false);
 });
