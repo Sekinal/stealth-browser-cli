@@ -1,6 +1,6 @@
 {
   "name": "stealth-browser-cli",
-  "version": "0.1.20",
+  "version": "0.1.21",
   "description": "Stealth browser automation CLI on CloakBrowser, with opt-in Patchright and Camoufox provider fallbacks",
   "repository": {
     "type": "git",
