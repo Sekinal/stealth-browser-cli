@@ -903,7 +903,6 @@ test('generated provider config directories are removed on exit', async ({}) => 
   expect(configDir).toContain('playwright-cli-browser-');
   expect(fs.existsSync(configDir)).toBe(false);
 });
-
 test('challenge detection flags Cloudflare-style pages', async ({}) => {
   const { detectChallengeFromText } = require('../cliEnhancements');
   // detectChallengeFromText is not exported; test via the payload path instead
@@ -961,13 +960,12 @@ test('host-resolver-rules flag is extracted for DNS override', async ({}) => {
 });
 
 test('request-headers and response-headers --json return structured headers', async ({}) => {
-  await runCli('-s=headers-test', 'open', 'https://httpbin.org/get');
-  const sleep = Promise.withResolvers<void>();
-  setTimeout(() => sleep.resolve(), 2000);
-  await sleep.promise;
+  const opened = await runCli('-s=headers-test', 'open', 'https://httpbin.org/get');
+  expect(opened.exitCode, opened.error).toBe(0);
+  await new Promise(resolve => setTimeout(resolve, 2000));
   const responseHeaders = await runCli('-s=headers-test', 'response-headers', '1', '--json');
   const payload = JSON.parse(responseHeaders.output);
-  expect(payload.ok).toBe(true);
+  expect(payload.ok, responseHeaders.output).toBe(true);
   expect(typeof payload.result.headers).toBe('object');
   expect(payload.result.headers).toEqual(expect.objectContaining({ 'content-type': 'application/json' }));
   await runCli('-s=headers-test', 'close');
