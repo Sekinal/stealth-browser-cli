@@ -46,6 +46,11 @@ main().catch(error => {
 async function main() {
   const argv = process.argv.slice(2);
   const command = argv.find(arg => !arg.startsWith('-'));
+  if (command === 'cleanup') {
+    const { runCleanup } = require('./cliEnhancements');
+    runCleanup(argv);
+    return;
+  }
   if (command !== 'install')
     checkInstalledSkills();
   const providerConfig = await configureBrowserProviderFallbacks({ command, sessionModule });

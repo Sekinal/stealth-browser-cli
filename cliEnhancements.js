@@ -50,8 +50,11 @@ function extendHelp(help) {
   const goto = help.commands?.goto;
   if (goto) {
     goto.flags.timeout = 'string';
+    goto.flags['wait-until'] = 'string';
     if (!goto.help.includes('--timeout'))
       goto.help += '\n  --timeout                   navigation timeout in seconds';
+    if (!goto.help.includes('--wait-until'))
+      goto.help += '\n  --wait-until                navigation wait strategy: load, domcontentloaded, networkidle0, networkidle2';
   }
 
   const evaluate = help.commands?.eval;
@@ -66,6 +69,21 @@ function extendHelp(help) {
     snapshot.flags.inline = 'boolean';
     if (!snapshot.help.includes('--inline'))
       snapshot.help += '\n  --inline                    return the snapshot inline instead of writing a file';
+  }
+
+  if (!help.commands.fetch) {
+    help.commands.fetch = {
+      flags: { method: 'string', data: 'string', header: 'string', timeout: 'string' },
+      args: ['url'],
+      raw: true,
+      help: [
+        'playwright-cli fetch <url>               make an HTTP request via the browser network stack',
+        '  --method=GET|POST|PUT|PATCH|DELETE|HEAD  HTTP method (default GET)',
+        '  --data=<body>                            request body (POST/PUT/PATCH)',
+        '  --header="Key: Value"                    request header (comma-separated)',
+        '  --timeout=<seconds>                      request timeout (default: no timeout)',
+      ].join('\n'),
+    };
   }
 }
 
@@ -139,6 +157,16 @@ function patchSession(Session, options) {
         rewriteEvalOutput(evalOutputPath);
         result = { ...result, text: absoluteEvalOutputLink(result.text, evalOutputPath) };
       }
+      if (!result.isError && runOptions?.raw) {
+        const cmd = args._?.[0];
+        try {
+          const parsed = JSON.parse(result.text);
+          if (cmd === 'fetch' && parsed && typeof parsed.body === 'string')
+            result = { ...result, text: parsed.body };
+          else if (cmd === 'eval' && typeof parsed === 'string')
+            result = { ...result, text: parsed };
+        } catch {}
+      }
       if (!runOptions?.json)
         return result;
 
@@ -155,12 +183,29 @@ function patchSession(Session, options) {
       }
 
       const [page, consoleEntries] = await readSessionContext(originalRun, this, clientInfo);
+      const normalizedResult = normalizeCommandResult(args._?.[0], normalizeUpstreamResult(upstreamPayload));
+      const cmd = args._?.[0];
+      if (cmd === 'fetch' && normalizedResult && typeof normalizedResult === 'object' && !Array.isArray(normalizedResult)) {
+        const fetchChallenge = detectChallengeFromText(null, typeof normalizedResult.body === 'string' ? normalizedResult.body : '', typeof normalizedResult.status === 'number' ? normalizedResult.status : null);
+        if (fetchChallenge.blocked)
+          normalizedResult.challenge = fetchChallenge;
+      }
+      if (cmd === 'fetch' && normalizedResult && typeof normalizedResult === 'object' && normalizedResult.failed) {
+        const payload = {
+          ...successPayload(page, null, consoleEntries, providerDetailsForSession(this, options.env), fallbackDetailsForSession(this, options.env), proxyDetails(options.env)),
+          ok: false,
+          result: normalizedResult,
+          error: `HTTP ${normalizedResult.status} ${normalizedResult.statusText ?? ''}`.trim(),
+        };
+        return { ...result, text: JSON.stringify(payload, null, 2) };
+      }
       const payload = successPayload(
           page,
-          normalizeUpstreamResult(upstreamPayload),
+          normalizedResult,
           consoleEntries,
           providerDetailsForSession(this, options.env),
-          fallbackDetailsForSession(this, options.env));
+          fallbackDetailsForSession(this, options.env),
+          proxyDetails(options.env));
       return { ...result, text: JSON.stringify(payload, null, 2) };
     } catch (error) {
       if (runOptions?.json) {
@@ -220,7 +265,7 @@ function patchOutput(outputModule, env) {
       } else if (value?.isError) {
         payload = failurePayload(value.error, undefined, [], providerDetails(env), fallbackDetails(env));
       } else {
-        payload = successPayload(undefined, value, [], providerDetails(env), fallbackDetails(env));
+        payload = successPayload(undefined, value, [], providerDetails(env), fallbackDetails(env), proxyDetails(env));
       }
       return originalEmit.call(this, payload);
     };
@@ -247,15 +292,124 @@ function prepareCommandArgs(args) {
     delete prepared.inline;
   }
 
-  if (command === 'goto' && prepared.timeout !== undefined) {
-    const timeoutMs = parseTimeoutMs(prepared.timeout);
+  if (command === 'goto') {
+    const hasTimeout = prepared.timeout !== undefined;
+    const hasWaitUntil = prepared['wait-until'] !== undefined;
+    if (hasTimeout || hasWaitUntil) {
+      const url = prepared._[1];
+      if (typeof url !== 'string' || !url)
+        throw new Error('goto requires a URL (for example, goto https://example.com --timeout=5).');
+      const timeoutMs = hasTimeout ? parseTimeoutMs(prepared.timeout) : 60000;
+      const waitUntil = hasWaitUntil ? prepared['wait-until'] : 'domcontentloaded';
+      if (hasWaitUntil && !['load', 'domcontentloaded', 'networkidle0', 'networkidle2'].includes(waitUntil))
+        throw new Error(`Invalid --wait-until value '${waitUntil}'. Expected one of: load, domcontentloaded, networkidle0, networkidle2.`);
+      delete prepared.timeout;
+      delete prepared['wait-until'];
+      prepared._ = ['run-code', `async (page) => {
+  const detectChallenge = async (status, title) => {
+    const text = (title || '') + ' ' + (await page.evaluate(() => document.body ? document.body.innerText.slice(0, 2000) : '').catch(() => ''));
+    const lower = text.toLowerCase();
+    if (status === 403)
+      return { type: '403', blocked: true };
+    if (status === 429)
+      return { type: 'rate-limit', blocked: true };
+    if (lower.includes('just a moment') || lower.includes('checking your browser') || lower.includes('enable javascript'))
+      return { type: 'cloudflare', blocked: true };
+    if (lower.includes('performing security verification') || lower.includes('ray id'))
+      return { type: 'cloudflare', blocked: true };
+    if (lower.includes('please enable js and disable any ad blocker') || lower.includes('datadome'))
+      return { type: 'datadome', blocked: true };
+    if (lower.includes('access denied') || lower.includes('you have been blocked') || lower.includes('your access has been') || lower.includes("you don't have permission"))
+      return { type: 'blocked', blocked: true };
+    if (lower.includes('captcha') || lower.includes('select all squares') || lower.includes('i am not a robot'))
+      return { type: 'captcha', blocked: true };
+    return { type: 'none', blocked: false };
+  };
+  const requestedUrl = ${JSON.stringify(url)};
+  const response = await page.goto(requestedUrl, { waitUntil: '${waitUntil}', timeout: ${timeoutMs} });
+  const finalUrl = page.url();
+  const hostOf = (u) => { const m = u.match(/^[a-z][a-z0-9+.-]*:\\/\\/([^\\/?#]*)/i); return m ? m[1].toLowerCase() : u; };
+  const redirected = hostOf(requestedUrl) !== hostOf(finalUrl);
+  const title = await page.title();
+  const status = response ? response.status() : null;
+  const challenge = await detectChallenge(status, title);
+  const bodyLength = await page.evaluate(() => document.body ? document.body.innerText.length : 0);
+  return {
+    navigation: 'succeeded',
+    url: finalUrl,
+    title,
+    status,
+    redirected,
+    challenge,
+    bodyLength,
+    emptyBody: bodyLength === 0,
+  };
+}`];
+    }
+  }
+
+  if (command === 'fetch') {
     const url = prepared._[1];
     if (typeof url !== 'string' || !url)
-      throw new Error('goto requires a URL (for example, goto https://example.com --timeout=5).');
+      throw new Error('fetch requires a URL (for example, fetch https://api.example.com/data).');
+    const method = (prepared.method ?? 'GET').toUpperCase();
+    if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD'].includes(method))
+      throw new Error(`Unsupported fetch method '${prepared.method}'. Expected one of: GET, POST, PUT, PATCH, DELETE, HEAD.`);
+    const data = prepared.data;
+    const headerArg = prepared.header;
+    const timeoutMs = prepared.timeout !== undefined ? parseTimeoutMs(prepared.timeout) : undefined;
+    delete prepared.method;
+    delete prepared.data;
+    delete prepared.header;
     delete prepared.timeout;
+    const requestOptions = [
+      data !== undefined ? `data: ${JSON.stringify(data)}` : '',
+      headerArg !== undefined ? `headers: ${JSON.stringify(parseHeaderArg(headerArg))}` : '',
+      timeoutMs !== undefined ? `timeout: ${timeoutMs}` : '',
+    ].filter(Boolean).join(', ');
     prepared._ = ['run-code', `async (page) => {
-  await page.goto(${JSON.stringify(url)}, { waitUntil: 'domcontentloaded', timeout: ${timeoutMs} });
-  return { navigation: 'succeeded' };
+  const url = ${JSON.stringify(url)};
+  const isSpecialScheme = /^(data|about|blob):/.test(url);
+  if (isSpecialScheme) {
+    // APIRequestContext only supports http(s); fall back to in-page fetch for
+    // data:/about:/blob: URLs (same-origin, no CORS concern).
+    const res = await page.evaluate(async (u) => {
+      const r = await fetch(u);
+      return { status: r.status, statusText: r.statusText, headers: Object.fromEntries(r.headers.entries()), body: await r.text() };
+    }, url);
+    return { ...res, url, redirected: false, failed: res.status >= 400 };
+  }
+  const response = await page.request.${method.toLowerCase()}(url${requestOptions ? ', { ' + requestOptions + ' }' : ''});
+  const status = response.status();
+  const finalUrl = response.url();
+  const redirected = url !== finalUrl;
+  const headers = {};
+  for (const h of response.headersArray())
+    headers[h.name.toLowerCase()] = h.value;
+  const contentType = headers['content-type'] ?? '';
+  const isBinary = /octet-stream|image\\/|application\\/pdf|application\\/zip|application\\/gzip|audio\\/|video\\/|font\\//.test(contentType);
+  let body;
+  let binary = false;
+  if (isBinary) {
+    const buf = await response.body();
+    body = buf.toString('base64');
+    binary = true;
+  } else {
+    body = await response.text();
+  }
+  let json = null;
+  if (!binary) { try { json = JSON.parse(body); } catch (_) {} }
+  return {
+    status,
+    statusText: response.statusText(),
+    url: finalUrl,
+    redirected,
+    headers,
+    body,
+    ...(binary ? { binary: true } : {}),
+    ...(json !== null ? { json } : {}),
+    failed: status >= 400,
+  };
 }`];
   }
 
@@ -347,11 +501,28 @@ function readSessionContext(originalRun, session, clientInfo) {
 async function readPageMetadata(originalRun, session, clientInfo) {
   try {
     const response = await originalRun.call(session, clientInfo, {
-      _: ['eval', '() => ({ url: location.href, title: document.title })'],
+      _: ['eval', `() => ({
+        url: location.href,
+        title: document.title,
+        bodyLength: document.body ? document.body.innerText.length : 0,
+        bodyText: document.body ? document.body.innerText.slice(0, 2000) : '',
+        webdriver: navigator.webdriver,
+      })`],
     }, { json: true, raw: false });
     const payload = normalizeUpstreamResult(parseJsonText(response.text));
-    if (payload && typeof payload === 'object')
-      return { url: stringOrNull(payload.url), title: stringOrNull(payload.title) };
+    if (payload && typeof payload === 'object') {
+      const title = stringOrNull(payload.title);
+      const bodyText = stringOrNull(payload.bodyText) ?? '';
+      const bodyLength = typeof payload.bodyLength === 'number' ? payload.bodyLength : null;
+      return {
+        url: stringOrNull(payload.url),
+        title,
+        bodyLength,
+        emptyBody: bodyLength === 0,
+        webdriver: !!payload.webdriver,
+        challenge: detectChallengeFromText(title, bodyText),
+      };
+    }
   } catch {
   }
   return undefined;
@@ -375,6 +546,186 @@ async function readConsoleEntries(originalRun, session, clientInfo) {
 /**
  * @param {unknown} value
  */
+
+/**
+ * Parse upstream text output into structured data for commands whose daemon
+ * responses are plain text, not JSON. This gives agents machine-readable
+ * results in --json mode instead of forcing them to regex-parse Markdown.
+ *
+ * @param {string | undefined} command
+ * @param {unknown} upstreamResult
+ * @returns {unknown}
+ */
+function normalizeCommandResult(command, upstreamResult) {
+  if (typeof upstreamResult !== 'string')
+    return upstreamResult;
+
+  if (command === 'tab-list')
+    return parseTabList(upstreamResult);
+  if (command === 'console')
+    return parseConsoleOutput(upstreamResult);
+  if (command === 'requests')
+    return parseRequestsList(upstreamResult);
+  if (command === 'request')
+    return parseRequestDetail(upstreamResult);
+  if (command === 'request-headers' || command === 'response-headers')
+    return { headers: parseHeaderLines(upstreamResult) };
+  if (command === 'request-body' || command === 'response-body')
+    return parseBodyText(upstreamResult);
+
+  return upstreamResult;
+}
+
+/**
+ * Parse header key-value lines into an object.
+ * @param {string} text
+ * @returns {Record<string, string>}
+ */
+function parseHeaderLines(text) {
+  const headers = /** @type {Record<string, string>} */ ({});
+  for (const line of text.split(/\r?\n/)) {
+    const kv = line.match(/^([^:]+):\s*(.*)$/);
+    if (kv)
+      headers[kv[1].trim()] = kv[2].trim();
+  }
+  return headers;
+}
+
+/**
+ * Parse a single `--header="Key: Value"` argument into an object. Multiple
+ * comma-separated headers are supported.
+ * @param {string} arg
+ * @returns {Record<string, string>}
+ */
+function parseHeaderArg(arg) {
+  const headers = /** @type {Record<string, string>} */ ({});
+  for (const part of String(arg).split(',')) {
+    const kv = part.match(/^([^:]+):\s*(.*)$/);
+    if (kv)
+      headers[kv[1].trim()] = kv[2].trim();
+  }
+  return headers;
+}
+
+/**
+ * Parse a body: return raw text plus a parsed JSON value when applicable.
+ * @param {string} text
+ */
+function parseBodyText(text) {
+  let json = null;
+  try {
+    json = JSON.parse(text);
+  } catch {}
+  return json !== null ? { body: text, json } : { body: text };
+}
+
+/**
+ * Parse tab-list output: "- 0: [Title](url)\n- 1: (current) [Title](url)"
+ * @param {string} text
+ */
+function parseTabList(text) {
+  const tabs = [];
+  const re = /^- (\d+):( \(current\))? \[([^\]]+)\]\(([^)]+)\)$/gm;
+  let match;
+  while ((match = re.exec(text)) !== null) {
+    tabs.push({
+      index: parseInt(match[1], 10),
+      current: !!match[2],
+      title: match[3],
+      url: match[4],
+    });
+  }
+  return { tabs };
+}
+
+/**
+ * Parse console output:
+ *   "Total messages: N (Errors: X, Warnings: Y)\n[ERROR] msg\n[WARNING] msg"
+ * @param {string} text
+ */
+function parseConsoleOutput(text) {
+  const lines = text.split(/\r?\n/);
+  const messages = [];
+  const levelMap = /** @type {Record<string, string>} */ ({ '[ERROR]': 'error', '[WARNING]': 'warning', '[INFO]': 'info', '[DEBUG]': 'debug', '[LOG]': 'log' });
+  let summary = { total: 0, errors: 0, warnings: 0 };
+
+  const summaryMatch = text.match(/Total messages:\s*(\d+)\s*\(Errors:\s*(\d+),\s*Warnings:\s*(\d+)\)/);
+  if (summaryMatch) {
+    summary = {
+      total: parseInt(summaryMatch[1], 10),
+      errors: parseInt(summaryMatch[2], 10),
+      warnings: parseInt(summaryMatch[3], 10),
+    };
+  }
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('Total messages:') || trimmed === '### Result')
+      continue;
+    for (const [prefix, level] of Object.entries(levelMap)) {
+      if (trimmed.startsWith(prefix)) {
+        messages.push({ level, text: trimmed.slice(prefix.length).trim() });
+        break;
+      }
+    }
+  }
+
+  return { messages, summary };
+}
+
+/**
+ * Parse requests list: "1. [GET] url => [200] \n2. [POST] url => [404] "
+ * @param {string} text
+ */
+function parseRequestsList(text) {
+  const requests = [];
+  const re = /^(\d+)\.\s+\[(\w+)\]\s+(\S+)\s+=>\s+\[(\d+)\]/gm;
+  let match;
+  while ((match = re.exec(text)) !== null) {
+    requests.push({
+      index: parseInt(match[1], 10),
+      method: match[2],
+      url: match[3],
+      status: parseInt(match[4], 10),
+    });
+  }
+  return { requests };
+}
+
+/**
+ * Parse request detail output into structured sections.
+ * @param {string} text
+ */
+function parseRequestDetail(text) {
+  const headerMatch = text.match(/^#(\d+)\s+\[(\w+)\]\s+(\S+)/m);
+  const result = {
+    index: headerMatch ? parseInt(headerMatch[1], 10) : null,
+    method: headerMatch?.[2] ?? null,
+    url: headerMatch?.[3] ?? null,
+    general: /** @type {Record<string, string>} */ ({}),
+    requestHeaders: /** @type {Record<string, string>} */ ({}),
+    responseHeaders: /** @type {Record<string, string>} */ ({}),
+  };
+
+  let section = '';
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (trimmed === 'General') { section = 'general'; continue; }
+    if (trimmed === 'Request headers') { section = 'requestHeaders'; continue; }
+    if (trimmed === 'Response headers') { section = 'responseHeaders'; continue; }
+    if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('Run `'))
+      continue;
+    const kv = trimmed.match(/^(\S[\w\s-]+?):\s+(.*)/);
+    if (kv && section) {
+      const key = kv[1].trim();
+      const value = kv[2].trim();
+      result[section][key] = value;
+    }
+  }
+
+  return result;
+}
+
 function normalizeUpstreamResult(value) {
   if (value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === 1 && 'result' in value)
     return parseJsonText(value.result);
@@ -401,6 +752,25 @@ function parseConsoleText(text) {
   return text.split(/\r?\n/).map(line => line.trim()).filter(line => line && !/^Total messages:/i.test(line));
 }
 
+function detectChallengeFromText(title, bodyText, status) {
+  const lower = `${title ?? ''} ${bodyText ?? ''}`.toLowerCase();
+  if (lower.includes('just a moment') || lower.includes('checking your browser') || lower.includes('enable javascript'))
+    return { type: 'cloudflare', blocked: true };
+  if (lower.includes('performing security verification') || lower.includes('ray id'))
+    return { type: 'cloudflare', blocked: true };
+  if (lower.includes('please enable js and disable any ad blocker') || lower.includes('datadome'))
+    return { type: 'datadome', blocked: true };
+  if (lower.includes('access denied') || lower.includes('you have been blocked') || lower.includes('your access has been') || lower.includes("you don't have permission"))
+    return { type: 'blocked', blocked: true };
+  if (lower.includes('captcha') || lower.includes('select all squares') || lower.includes('i am not a robot'))
+    return { type: 'captcha', blocked: true };
+  if (status === 403)
+    return { type: '403', blocked: true };
+  if (status === 429)
+    return { type: 'rate-limit', blocked: true };
+  return { type: 'none', blocked: false };
+}
+
 /**
  * @param {{ url: string | null, title: string | null } | undefined} page
  * @param {unknown} result
@@ -408,7 +778,7 @@ function parseConsoleText(text) {
  * @param {{ name: string, version: string } | undefined} provider
  * @param {{ requested: string, active: string, reason: string } | undefined} fallback
  */
-function successPayload(page, result, consoleEntries, provider, fallback) {
+function successPayload(page, result, consoleEntries, provider, fallback, proxy) {
   return {
     ok: true,
     url: page?.url ?? null,
@@ -416,6 +786,10 @@ function successPayload(page, result, consoleEntries, provider, fallback) {
     result: result ?? null,
     console: consoleEntries,
     provider: provider ?? null,
+    ...(page?.challenge ? { challenge: page.challenge } : {}),
+    ...(page?.bodyLength !== undefined ? { bodyLength: page.bodyLength, emptyBody: page.emptyBody } : {}),
+    ...(page?.webdriver !== undefined ? { webdriver: page.webdriver } : {}),
+    ...(proxy ? { proxy } : {}),
     ...(fallback ? { fallback } : {}),
   };
 }
@@ -438,6 +812,22 @@ function failurePayload(error, page, consoleEntries = [], provider, fallback) {
     ...(provider ? { provider } : {}),
     ...(fallback ? { fallback } : {}),
   };
+}
+
+/**
+ * Surface the effective proxy configuration so agents can tell where traffic
+ * is actually going. Reports the resolved proxy server and bypass rules from
+ * the upstream env contract (PLAYWRIGHT_MCP_*) plus conventional HTTP(S)_PROXY.
+ *
+ * @param {NodeJS.ProcessEnv} env
+ * @returns {{ server: string, bypass: string | undefined } | undefined}
+ */
+function proxyDetails(env) {
+  const server = env.PLAYWRIGHT_MCP_PROXY_SERVER || env.HTTPS_PROXY || env.HTTP_PROXY;
+  if (!server)
+    return undefined;
+  const bypass = env.PLAYWRIGHT_MCP_PROXY_BYPASS || env.NO_PROXY;
+  return bypass ? { server, bypass } : { server };
 }
 
 /**
@@ -600,6 +990,55 @@ function errorMessage(error) {
   const message = error instanceof Error ? error.message : typeof error === 'string' ? error : serializeUnknownError(error);
   return message.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '');
 }
+/**
+ * Remove accumulated snapshot/console artifacts from `.playwright-cli/`.
+ * `--all` removes everything; `--days=N` (default 7) removes files older than N
+ * days. Long-running agent sessions otherwise grow this directory without bound.
+ *
+ * @param {string[]} argv
+ */
+function runCleanup(argv) {
+  const fsSync = require('fs');
+  const pathSync = require('path');
+  const outputDir = pathSync.join(process.cwd(), '.playwright-cli');
+  const all = argv.includes('--all');
+  const json = argv.includes('--json');
+  const daysArg = argv.find(arg => arg.startsWith('--days='));
+  const days = daysArg ? parseFloat(daysArg.split('=')[1]) : 7;
+
+  if (!fsSync.existsSync(outputDir)) {
+    const empty = { removed: 0, remaining: 0, dir: outputDir };
+    if (json)
+      process.stdout.write(JSON.stringify(empty, null, 2) + '\n');
+    else
+      console.log('No .playwright-cli directory to clean.');
+    return;
+  }
+
+  const cutoff = Date.now() - (isFinite(days) && days >= 0 ? days : 7) * 24 * 60 * 60 * 1000;
+  const entries = fsSync.readdirSync(outputDir);
+  let removed = 0;
+  for (const name of entries) {
+    if (!/^(page-.*\.yml|console-.*\.log|snapshot-.*|video-.*)$/.test(name))
+      continue;
+    const fullPath = pathSync.join(outputDir, name);
+    try {
+      const stat = fsSync.statSync(fullPath);
+      if (all || stat.mtimeMs < cutoff) {
+        fsSync.unlinkSync(fullPath);
+        removed++;
+      }
+    } catch {
+    }
+  }
+
+  const remaining = fsSync.readdirSync(outputDir).length;
+  const result = { removed, remaining, dir: outputDir };
+  if (json)
+    process.stdout.write(JSON.stringify(result, null, 2) + '\n');
+  else
+    console.log(`Removed ${removed} artifact(s); ${remaining} file(s) remain in ${outputDir}`);
+}
 
 /**
  * @param {string[]} argv
@@ -617,5 +1056,6 @@ module.exports = {
   parseTimeoutMs,
   prepareCommandArgs,
   resolveEvalOutputPath,
+  runCleanup,
   successPayload,
 };

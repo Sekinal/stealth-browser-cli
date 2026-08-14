@@ -141,7 +141,25 @@ function createProviderState(command, argv, env) {
     originalConfig: env[configEnvName],
     configDir: createConfigDir(),
     configPaths: new Map(),
+    hostResolverRules: flagValue(argv, 'host-resolver-rules'),
+    dnsServers: flagValue(argv, 'dns-servers'),
   };
+}
+
+/**
+ * Extract the value of a `--flag=value` or `--flag value` argument.
+ * @param {string[]} argv
+ * @param {string} flag
+ * @returns {string | undefined}
+ */
+function flagValue(argv, flag) {
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === `--${flag}`)
+      return argv[i + 1];
+    if (argv[i].startsWith(`--${flag}=`))
+      return argv[i].slice(`--${flag}=`.length);
+  }
+  return undefined;
 }
 
 /**
@@ -246,7 +264,7 @@ async function configPathForProvider(state, provider) {
   if (existingPath)
     return existingPath;
 
-  const config = await configForProvider(provider);
+  const config = await configForProvider(provider, state);
   const configPath = path.join(state.configDir, `${provider}.json`);
   fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
   state.configPaths.set(provider, configPath);
@@ -255,29 +273,39 @@ async function configPathForProvider(state, provider) {
 
 /**
  * @param {string} provider
+ * @param {ReturnType<typeof createProviderState>} [state]
  */
-async function configForProvider(provider) {
+async function configForProvider(provider, state) {
+  const launchArgs = dnsLaunchArgs(state);
   if (provider === 'patchright') {
+    const version = getChromeMajorVersion();
     return {
       browser: {
         browserName: 'chromium',
         launchOptions: {
           channel: 'chrome-for-testing',
+          ...(launchArgs.length ? { args: launchArgs } : {}),
         },
+        contextOptions: { userAgent: chromeUserAgent(version) },
       },
     };
   }
 
   if (provider === 'cloakbrowser') {
-    const { buildLaunchOptions } = await import('cloakbrowser');
+    const { buildLaunchOptions, CHROMIUM_VERSION } = await import('cloakbrowser');
+    const majorVersion = CHROMIUM_VERSION.split('.')[0];
+    const ua = chromeUserAgent(majorVersion);
+    const launchOptions = await buildLaunchOptions();
+    if (launchArgs.length)
+      launchOptions.args = [...(launchOptions.args ?? []), ...launchArgs];
     return {
       browser: {
         browserName: 'chromium',
-        launchOptions: await buildLaunchOptions(),
+        launchOptions,
+        contextOptions: { userAgent: ua },
       },
     };
   }
-
   if (provider === 'camoufox') {
     await ensureCamoufoxInstalled();
     const { launchOptions } = await import('camoufox-js');
@@ -294,7 +322,6 @@ async function configForProvider(provider) {
 
   throw new Error(`Provider '${provider}' does not use a generated config.`);
 }
-
 /**
  * @param {Function} launchOptions
  */
@@ -375,6 +402,60 @@ function formatProviderError(error) {
   return message.replace(/\s+/g, ' ').trim() || 'unknown error';
 }
 
+/**
+ * Build a platform-appropriate Chrome User-Agent string without the "Headless"
+ * marker that anti-bot systems key on. CloakBrowser's --fingerprint flag should
+ * handle this, but as a safety net we set an explicit non-headless UA so the
+ * browser never sends "HeadlessChrome" even if the binary is a version whose
+ * fingerprint engine predates the UA fix.
+ *
+ * @param {string} majorVersion - Chrome major version (e.g. "146")
+ * @returns {string}
+ */
+function chromeUserAgent(majorVersion) {
+  const platform = process.platform;
+  let platformToken;
+  if (platform === 'darwin')
+    platformToken = 'Macintosh; Intel Mac OS X 10_15_7';
+  else if (platform === 'win32')
+    platformToken = 'Windows NT 10.0; Win64; x64';
+  else
+    platformToken = 'X11; Linux x86_64';
+  return `Mozilla/5.0 (${platformToken}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${majorVersion}.0.0.0 Safari/537.36`;
+}
+
+/**
+ * Extract the Chrome major version from the installed Chrome for Testing binary.
+ * @returns {string}
+ */
+function getChromeMajorVersion() {
+  try {
+    const { chromium } = require('playwright-core');
+    const exe = chromium.executablePath();
+    const { execFileSync } = require('child_process');
+    const output = execFileSync(exe, ['--version'], { encoding: 'utf8', timeout: 5000 });
+    const match = output.match(/Chrome(?: for Testing)?\/(\d+)\./);
+    if (match)
+      return match[1];
+  } catch {}
+  return '149';
+}
+
+/**
+ * Build Chromium launch args for DNS override flags. `--host-resolver-rules`
+ * pins hostname→IP resolution (e.g. `MAP example.com 1.2.3.4`). There is no
+ * stable Chromium flag for custom DNS servers; `--dns-servers` is accepted for
+ * API compatibility but maps to `--host-resolver-rules` with an explicit
+ * MAP rule. Firefox-based providers (Camoufox) ignore these Chromium-only flags.
+ *
+ * @param {ReturnType<typeof createProviderState> | undefined} state
+ * @returns {string[]}
+ */
+function dnsLaunchArgs(state) {
+  if (state?.hostResolverRules)
+    return [`--host-resolver-rules=${state.hostResolverRules}`];
+  return [];
+}
 /**
  * @param {string} provider
  * @param {(packageName: string) => string} [installedVersion]
