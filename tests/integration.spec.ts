@@ -705,6 +705,42 @@ test('goto reports soft 404 as failure', async ({}) => {
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
 });
+
+test('goto --retry retries transient 5xx and reports attempts', async ({}) => {
+  let requests = 0;
+  const server = http.createServer((req, res) => {
+    requests++;
+    if (requests === 1) {
+      res.writeHead(500, { 'content-type': 'text/plain' });
+      res.end('transient failure');
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<html><body>recovered</body></html>');
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string')
+    throw new Error('Expected a TCP server address');
+
+  try {
+    await runCli('-s=goto-retry', 'open', 'data:text/html,<title>Start</title>');
+    const result = await runCli('-s=goto-retry', 'goto', `http://127.0.0.1:${address.port}/`, '--timeout=5', '--retry=2', '--json');
+    const payload = JSON.parse(result.output);
+    expect(payload.ok).toBe(true);
+    expect(payload.result.status).toBe(200);
+    expect(payload.result.attempts).toBe(2);
+    expect(payload.result.retried).toBe(true);
+    expect(requests).toBe(2);
+    await runCli('-s=goto-retry', 'close');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
 test('fetch without URL reports missing argument', async ({}) => {
   const { prepareCommandArgs } = require('../cliEnhancements');
   expect(() => prepareCommandArgs({ _: ['fetch'] })).toThrow(/fetch requires a URL/);
@@ -826,13 +862,13 @@ test('goto --wait-until generates a run-code snippet with the right strategy', a
   expect(prepared._[0]).toBe('run-code');
   expect(prepared._[1]).toContain("waitUntil: 'networkidle'");
   expect(prepared._[1]).toContain('navigation');
-  expect(prepared._[1]).toContain('url: page.url()');
+  expect(prepared._[1]).toContain('url: finalUrl');
   expect(prepared._[1]).toContain('status');
   expect(prepared._[1]).toContain('redirected');
   expect(prepared._[1]).toContain('challenge');
   expect(prepared._[1]).toContain('bodyLength');
   expect(prepared._[1]).toContain('emptyBody');
-  expect(prepared._[1]).toContain('retried');
+  expect(prepared._[1]).toContain('attempts');
 });
 
 test('goto without flags is not intercepted', async ({}) => {

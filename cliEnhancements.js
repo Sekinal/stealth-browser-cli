@@ -53,14 +53,16 @@ function extendHelp(help) {
     goto.flags['wait-until'] = 'string';
     goto.flags['retry-empty'] = 'boolean';
     goto.flags['retry-empty-delay'] = 'string';
+    goto.flags.retry = 'string';
+    goto.flags['retry-delay'] = 'string';
     if (!goto.help.includes('--timeout'))
       goto.help += '\n  --timeout                   navigation timeout in seconds';
     if (!goto.help.includes('--wait-until'))
       goto.help += '\n  --wait-until                navigation wait strategy: load, domcontentloaded, networkidle, commit';
-    if (!goto.help.includes('--retry-empty'))
-      goto.help += '\n  --retry-empty               wait and reload once if the page body is empty (JS-heavy sites)';
-    if (!goto.help.includes('--retry-empty-delay'))
-      goto.help += '\n  --retry-empty-delay=<ms>    delay before retrying an empty body (default 1500)';
+    if (!goto.help.includes('--retry'))
+      goto.help += '\n  --retry=<N>                 retry up to N times on transient failures (timeout, abort, empty body, 4xx)';
+    if (!goto.help.includes('--retry-delay'))
+      goto.help += '\n  --retry-delay=<ms>          delay between retries (default 1500)';
   }
 
   const evaluate = help.commands?.eval;
@@ -302,8 +304,10 @@ function prepareCommandArgs(args) {
     const hasTimeout = prepared.timeout !== undefined;
     const hasWaitUntil = prepared['wait-until'] !== undefined;
     const retryEmpty = prepared['retry-empty'] === true;
-    const retryDelayMs = prepared['retry-empty-delay'] !== undefined ? parseTimeoutMs(prepared['retry-empty-delay']) : 1500;
-    if (hasTimeout || hasWaitUntil || retryEmpty) {
+    const retryCount = prepared.retry !== undefined ? Math.max(0, parseInt(prepared.retry, 10) || 0) : 0;
+    const retryDelayMs = prepared['retry-delay'] !== undefined ? parseTimeoutMs(prepared['retry-delay'])
+        : prepared['retry-empty-delay'] !== undefined ? parseTimeoutMs(prepared['retry-empty-delay']) : 1500;
+    if (hasTimeout || hasWaitUntil || retryEmpty || retryCount > 0) {
       const url = prepared._[1];
       if (typeof url !== 'string' || !url)
         throw new Error('goto requires a URL (for example, goto https://example.com --timeout=5).');
@@ -315,6 +319,8 @@ function prepareCommandArgs(args) {
       delete prepared['wait-until'];
       delete prepared['retry-empty'];
       delete prepared['retry-empty-delay'];
+      delete prepared.retry;
+      delete prepared['retry-delay'];
       prepared._ = ['run-code', `async (page) => {
   const detectChallenge = async (status, title) => {
     const text = (title || '') + ' ' + (await page.evaluate(() => document.body ? document.body.innerText.slice(0, 2000) : '').catch(() => ''));
@@ -336,34 +342,49 @@ function prepareCommandArgs(args) {
     return { type: 'none', blocked: false };
   };
   const requestedUrl = ${JSON.stringify(url)};
-  const response = await page.goto(requestedUrl, { waitUntil: '${waitUntil}', timeout: ${timeoutMs} });
-  const finalUrl = page.url();
   const hostOf = (u) => { const m = u.match(/^[a-z][a-z0-9+.-]*:\\/\\/([^\\/?#]*)/i); return m ? m[1].toLowerCase() : u; };
+  const maxAttempts = ${retryCount} + 1;
+  let response = null;
+  let lastError = null;
+  let bodyLength = 0;
+  let attempts = 0;
+  for (let i = 0; i < maxAttempts; i++) {
+    attempts = i + 1;
+    try {
+      response = await page.goto(requestedUrl, { waitUntil: '${waitUntil}', timeout: ${timeoutMs} });
+      bodyLength = await page.evaluate(() => document.body ? document.body.innerText.length : 0);
+      lastError = null;
+    } catch (e) {
+      lastError = e;
+      bodyLength = 0;
+    }
+    const statusNow = response ? response.status() : null;
+    const retryOnEmpty = (${retryEmpty} || ${retryCount} > 0) && bodyLength === 0;
+    const retryOnError = ${retryCount} > 0 && lastError !== null;
+    const retryOnStatus = ${retryCount} > 0 && statusNow !== null && statusNow >= 400 && statusNow !== 404;
+    const shouldRetry = i < maxAttempts - 1 && (retryOnEmpty || retryOnError || retryOnStatus);
+    if (!shouldRetry)
+      break;
+    await page.waitForTimeout(${retryDelayMs});
+  }
+  if (lastError)
+    throw lastError;
+  const finalUrl = page.url();
   const redirected = hostOf(requestedUrl) !== hostOf(finalUrl);
   const title = await page.title();
   const status = response ? response.status() : null;
   const challenge = await detectChallenge(status, title);
-  let bodyLength = await page.evaluate(() => document.body ? document.body.innerText.length : 0);
-  let retried = false;
-  if (${retryEmpty} && bodyLength === 0) {
-    await page.waitForTimeout(${retryDelayMs});
-    bodyLength = await page.evaluate(() => document.body ? document.body.innerText.length : 0);
-    if (bodyLength === 0) {
-      await page.reload({ waitUntil: '${waitUntil}', timeout: ${timeoutMs} });
-      bodyLength = await page.evaluate(() => document.body ? document.body.innerText.length : 0);
-      retried = true;
-    }
-  }
   return {
     navigation: 'succeeded',
-    url: page.url(),
-    title: await page.title(),
+    url: finalUrl,
+    title,
     status,
     redirected,
     challenge,
     bodyLength,
     emptyBody: bodyLength === 0,
-    retried,
+    attempts,
+    retried: attempts > 1,
     failed: status !== null && status >= 400,
   };
 }`];
