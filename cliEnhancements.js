@@ -51,10 +51,13 @@ function extendHelp(help) {
   if (goto) {
     goto.flags.timeout = 'string';
     goto.flags['wait-until'] = 'string';
+    goto.flags['retry-empty'] = 'boolean';
     if (!goto.help.includes('--timeout'))
       goto.help += '\n  --timeout                   navigation timeout in seconds';
     if (!goto.help.includes('--wait-until'))
-      goto.help += '\n  --wait-until                navigation wait strategy: load, domcontentloaded, networkidle0, networkidle2';
+      goto.help += '\n  --wait-until                navigation wait strategy: load, domcontentloaded, networkidle, commit';
+    if (!goto.help.includes('--retry-empty'))
+      goto.help += '\n  --retry-empty               reload once if the page body is empty (JS-heavy sites)';
   }
 
   const evaluate = help.commands?.eval;
@@ -190,7 +193,7 @@ function patchSession(Session, options) {
         if (fetchChallenge.blocked)
           normalizedResult.challenge = fetchChallenge;
       }
-      if (cmd === 'fetch' && normalizedResult && typeof normalizedResult === 'object' && normalizedResult.failed) {
+      if ((cmd === 'fetch' || cmd === 'goto') && normalizedResult && typeof normalizedResult === 'object' && normalizedResult.failed) {
         const payload = {
           ...successPayload(page, null, consoleEntries, providerDetailsForSession(this, options.env), fallbackDetailsForSession(this, options.env), proxyDetails(options.env)),
           ok: false,
@@ -295,16 +298,18 @@ function prepareCommandArgs(args) {
   if (command === 'goto') {
     const hasTimeout = prepared.timeout !== undefined;
     const hasWaitUntil = prepared['wait-until'] !== undefined;
-    if (hasTimeout || hasWaitUntil) {
+    const retryEmpty = prepared['retry-empty'] === true;
+    if (hasTimeout || hasWaitUntil || retryEmpty) {
       const url = prepared._[1];
       if (typeof url !== 'string' || !url)
         throw new Error('goto requires a URL (for example, goto https://example.com --timeout=5).');
       const timeoutMs = hasTimeout ? parseTimeoutMs(prepared.timeout) : 60000;
       const waitUntil = hasWaitUntil ? prepared['wait-until'] : 'domcontentloaded';
-      if (hasWaitUntil && !['load', 'domcontentloaded', 'networkidle0', 'networkidle2'].includes(waitUntil))
-        throw new Error(`Invalid --wait-until value '${waitUntil}'. Expected one of: load, domcontentloaded, networkidle0, networkidle2.`);
+      if (hasWaitUntil && !['load', 'domcontentloaded', 'networkidle', 'commit'].includes(waitUntil))
+        throw new Error(`Invalid --wait-until value '${waitUntil}'. Expected one of: load, domcontentloaded, networkidle, commit.`);
       delete prepared.timeout;
       delete prepared['wait-until'];
+      delete prepared['retry-empty'];
       prepared._ = ['run-code', `async (page) => {
   const detectChallenge = async (status, title) => {
     const text = (title || '') + ' ' + (await page.evaluate(() => document.body ? document.body.innerText.slice(0, 2000) : '').catch(() => ''));
@@ -333,16 +338,24 @@ function prepareCommandArgs(args) {
   const title = await page.title();
   const status = response ? response.status() : null;
   const challenge = await detectChallenge(status, title);
-  const bodyLength = await page.evaluate(() => document.body ? document.body.innerText.length : 0);
+  let bodyLength = await page.evaluate(() => document.body ? document.body.innerText.length : 0);
+  let retried = false;
+  if (${retryEmpty} && bodyLength === 0) {
+    await page.reload({ waitUntil: '${waitUntil}', timeout: ${timeoutMs} });
+    bodyLength = await page.evaluate(() => document.body ? document.body.innerText.length : 0);
+    retried = true;
+  }
   return {
     navigation: 'succeeded',
-    url: finalUrl,
-    title,
+    url: page.url(),
+    title: await page.title(),
     status,
     redirected,
     challenge,
     bodyLength,
     emptyBody: bodyLength === 0,
+    retried,
+    failed: status !== null && status >= 400,
   };
 }`];
     }

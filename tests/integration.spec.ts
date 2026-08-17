@@ -677,6 +677,34 @@ test('fetch detects anti-bot challenge types from status and body', async ({}) =
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
 });
+
+test('goto reports soft 404 as failure', async ({}) => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(404, { 'content-type': 'text/html' });
+    res.end('<html><title>Not Found</title><body>Page not found</body></html>');
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string')
+    throw new Error('Expected a TCP server address');
+
+  try {
+    await runCli('-s=goto-soft404', 'open', 'data:text/html,<title>Start</title>');
+    const result = await runCli('-s=goto-soft404', 'goto', `http://127.0.0.1:${address.port}/`, '--timeout=5', '--json');
+    const payload = JSON.parse(result.output);
+    expect(payload.ok).toBe(false);
+    expect(payload.error).toContain('HTTP 404');
+    expect(payload.result.status).toBe(404);
+    expect(payload.result.failed).toBe(true);
+    await runCli('-s=goto-soft404', 'close');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
 test('fetch without URL reports missing argument', async ({}) => {
   const { prepareCommandArgs } = require('../cliEnhancements');
   expect(() => prepareCommandArgs({ _: ['fetch'] })).toThrow(/fetch requires a URL/);
@@ -794,16 +822,17 @@ test('invalid --wait-until value is rejected', async ({}) => {
 
 test('goto --wait-until generates a run-code snippet with the right strategy', async ({}) => {
   const { prepareCommandArgs } = require('../cliEnhancements');
-  const prepared = prepareCommandArgs({ _: ['goto', 'https://example.com'], 'wait-until': 'networkidle2' });
+  const prepared = prepareCommandArgs({ _: ['goto', 'https://example.com'], 'wait-until': 'networkidle' });
   expect(prepared._[0]).toBe('run-code');
-  expect(prepared._[1]).toContain("waitUntil: 'networkidle2'");
+  expect(prepared._[1]).toContain("waitUntil: 'networkidle'");
   expect(prepared._[1]).toContain('navigation');
-  expect(prepared._[1]).toContain('url: finalUrl');
+  expect(prepared._[1]).toContain('url: page.url()');
   expect(prepared._[1]).toContain('status');
   expect(prepared._[1]).toContain('redirected');
   expect(prepared._[1]).toContain('challenge');
   expect(prepared._[1]).toContain('bodyLength');
   expect(prepared._[1]).toContain('emptyBody');
+  expect(prepared._[1]).toContain('retried');
 });
 
 test('goto without flags is not intercepted', async ({}) => {
