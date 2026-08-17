@@ -337,7 +337,7 @@ function prepareCommandArgs(args) {
       return { type: 'datadome', blocked: true };
     if (lower.includes('access denied') || lower.includes('you have been blocked') || lower.includes('your access has been') || lower.includes("you don't have permission"))
       return { type: 'blocked', blocked: true };
-    if (lower.includes('captcha') || lower.includes('select all squares') || lower.includes('i am not a robot'))
+    if (lower.includes('select all squares') || lower.includes('i am not a robot') || lower.includes('verify you are human') || lower.includes('prove you are human') || lower.includes('complete the security check'))
       return { type: 'captcha', blocked: true };
     return { type: 'none', blocked: false };
   };
@@ -805,7 +805,7 @@ function detectChallengeFromText(title, bodyText, status) {
     return { type: 'datadome', blocked: true };
   if (lower.includes('access denied') || lower.includes('you have been blocked') || lower.includes('your access has been') || lower.includes("you don't have permission"))
     return { type: 'blocked', blocked: true };
-  if (lower.includes('captcha') || lower.includes('select all squares') || lower.includes('i am not a robot'))
+  if (lower.includes('select all squares') || lower.includes('i am not a robot') || lower.includes('verify you are human') || lower.includes('prove you are human') || lower.includes('complete the security check'))
     return { type: 'captcha', blocked: true };
   if (status === 403)
     return { type: '403', blocked: true };
