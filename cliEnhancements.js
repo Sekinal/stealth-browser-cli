@@ -81,7 +81,7 @@ function extendHelp(help) {
 
   if (!help.commands.fetch) {
     help.commands.fetch = {
-      flags: { method: 'string', data: 'string', header: 'string', timeout: 'string' },
+      flags: { method: 'string', data: 'string', header: 'string', timeout: 'string', user: 'string', password: 'string', retry: 'string' },
       args: ['url'],
       raw: true,
       help: [
@@ -89,7 +89,19 @@ function extendHelp(help) {
         '  --method=GET|POST|PUT|PATCH|DELETE|HEAD  HTTP method (default GET)',
         '  --data=<body>                            request body (POST/PUT/PATCH)',
         '  --header="Key: Value"                    request header (comma-separated)',
+        '  --user=<name> --password=<secret>        basic authentication',
         '  --timeout=<seconds>                      request timeout (default: no timeout)',
+        '  --retry=<N>                              retry up to N times on 5xx/network errors',
+      ].join('\n'),
+    };
+  }
+  if (!help.commands['wait-for']) {
+    help.commands['wait-for'] = {
+      flags: { timeout: 'string' },
+      args: ['selector'],
+      help: [
+        'playwright-cli wait-for <selector>      wait until an element matching a selector appears',
+        '  --timeout=<seconds>                     timeout (default 5)',
       ].join('\n'),
     };
   }
@@ -412,28 +424,61 @@ function prepareCommandArgs(args) {
     const data = prepared.data;
     const headerArg = prepared.header;
     const timeoutMs = prepared.timeout !== undefined ? parseTimeoutMs(prepared.timeout) : undefined;
+    const retryCount = prepared.retry !== undefined ? Math.max(0, parseInt(prepared.retry, 10) || 0) : 0;
+    // Basic auth: build the Authorization header here (Node has Buffer) rather
+    // than in the sandbox, which lacks Node globals.
+    let authHeader = null;
+    if (prepared.user !== undefined || prepared.password !== undefined) {
+      const creds = Buffer.from(`${prepared.user ?? ''}:${prepared.password ?? ''}`).toString('base64');
+      authHeader = `Authorization: Basic ${creds}`;
+    }
     delete prepared.method;
     delete prepared.data;
     delete prepared.header;
     delete prepared.timeout;
+    delete prepared.retry;
+    delete prepared.user;
+    delete prepared.password;
+    const mergedHeaders = {
+      ...(headerArg !== undefined ? parseHeaderArg(headerArg) : {}),
+      ...(authHeader ? parseHeaderArg(authHeader) : {}),
+    };
+    const hasHeaders = Object.keys(mergedHeaders).length > 0;
     const requestOptions = [
       data !== undefined ? `data: ${JSON.stringify(data)}` : '',
-      headerArg !== undefined ? `headers: ${JSON.stringify(parseHeaderArg(headerArg))}` : '',
+      hasHeaders ? `headers: ${JSON.stringify(mergedHeaders)}` : '',
       timeoutMs !== undefined ? `timeout: ${timeoutMs}` : '',
     ].filter(Boolean).join(', ');
+    const maxAttempts = retryCount + 1;
     prepared._ = ['run-code', `async (page) => {
   const url = ${JSON.stringify(url)};
   const isSpecialScheme = /^(data|about|blob):/.test(url);
   if (isSpecialScheme) {
-    // APIRequestContext only supports http(s); fall back to in-page fetch for
-    // data:/about:/blob: URLs (same-origin, no CORS concern).
     const res = await page.evaluate(async (u) => {
       const r = await fetch(u);
       return { status: r.status, statusText: r.statusText, headers: Object.fromEntries(r.headers.entries()), body: await r.text() };
     }, url);
     return { ...res, url, redirected: false, failed: res.status >= 400 };
   }
-  const response = await page.request.${method.toLowerCase()}(url${requestOptions ? ', { ' + requestOptions + ' }' : ''});
+  let response = null;
+  let lastError = null;
+  let attempts = 0;
+  for (let i = 0; i < ${maxAttempts}; i++) {
+    attempts = i + 1;
+    try {
+      response = await page.request.${method.toLowerCase()}(url${requestOptions ? ', { ' + requestOptions + ' }' : ''});
+      lastError = null;
+    } catch (e) {
+      lastError = e;
+    }
+    const statusNow = response ? response.status() : null;
+    const shouldRetry = ${retryCount} > 0 && i < ${maxAttempts} - 1 && (lastError !== null || (statusNow !== null && statusNow >= 500));
+    if (!shouldRetry)
+      break;
+    await page.waitForTimeout(1500);
+  }
+  if (lastError && !response)
+    throw lastError;
   const status = response.status();
   const finalUrl = response.url();
   const redirected = url !== finalUrl;
@@ -460,10 +505,33 @@ function prepareCommandArgs(args) {
     redirected,
     headers,
     body,
+    attempts,
+    retried: attempts > 1,
     ...(binary ? { binary: true } : {}),
     ...(json !== null ? { json } : {}),
     failed: status >= 400,
   };
+}`];
+  }
+
+  if (command === 'wait-for') {
+    const selector = prepared._[1];
+    if (typeof selector !== 'string' || !selector)
+      throw new Error('wait-for requires a selector (for example, wait-for "text=Submit" or "#main").');
+    const timeoutMs = prepared.timeout !== undefined ? parseTimeoutMs(prepared.timeout) : 5000;
+    delete prepared.timeout;
+    prepared._ = ['run-code', `async (page) => {
+  const target = ${JSON.stringify(selector)};
+  try {
+    const element = await page.waitForSelector(target, { timeout: ${timeoutMs} });
+    return {
+      found: true,
+      selector: target,
+      text: await element.textContent().catch(() => null),
+    };
+  } catch (e) {
+    return { found: false, selector: target, error: e.message };
+  }
 }`];
   }
 

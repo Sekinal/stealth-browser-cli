@@ -695,6 +695,83 @@ test('goto detects captcha widgets in the DOM (turnstile/recaptcha/hcaptcha)', a
   await runCli('-s=captcha-widget', 'close');
 });
 
+test('fetch supports basic auth via --user/--password', async ({}) => {
+  const server = http.createServer((req, res) => {
+    const auth = req.headers.authorization ?? '';
+    if (auth === `Basic ${Buffer.from('alice:secret').toString('base64')}`) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"authenticated":true}');
+    } else {
+      res.writeHead(401, { 'content-type': 'text/plain' });
+      res.end('unauthorized');
+    }
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string')
+    throw new Error('Expected a TCP server address');
+
+  try {
+    await runCli('-s=fetch-auth', 'open', 'data:text/html,<title>A</title>');
+    const result = await runCli('-s=fetch-auth', 'fetch', `http://127.0.0.1:${address.port}/`, '--user=alice', '--password=secret', '--json');
+    const payload = JSON.parse(result.output);
+    expect(payload.ok).toBe(true);
+    expect(payload.result.json.authenticated).toBe(true);
+    await runCli('-s=fetch-auth', 'close');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('wait-for waits for a selector or text to appear', async ({}) => {
+  await runCli('-s=wait-for-test', 'open', 'data:text/html,<h1>Welcome</h1>');
+  const found = await runCli('-s=wait-for-test', 'wait-for', 'text=Welcome', '--timeout=5', '--json');
+  expect(JSON.parse(found.output).result.found).toBe(true);
+
+  const missing = await runCli('-s=wait-for-test', 'wait-for', 'text=DefinitelyNotHere', '--timeout=1', '--json');
+  expect(JSON.parse(missing.output).result.found).toBe(false);
+  await runCli('-s=wait-for-test', 'close');
+});
+
+test('fetch --retry retries transient 5xx', async ({}) => {
+  let requests = 0;
+  const server = http.createServer((req, res) => {
+    requests++;
+    if (requests === 1) {
+      res.writeHead(503, { 'content-type': 'text/plain' });
+      res.end('overloaded');
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string')
+    throw new Error('Expected a TCP server address');
+
+  try {
+    await runCli('-s=fetch-retry', 'open', 'data:text/html,<title>R</title>');
+    const result = await runCli('-s=fetch-retry', 'fetch', `http://127.0.0.1:${address.port}/`, '--retry=2', '--json');
+    const payload = JSON.parse(result.output);
+    expect(payload.ok).toBe(true);
+    expect(payload.result.status).toBe(200);
+    expect(payload.result.attempts).toBe(2);
+    expect(payload.result.retried).toBe(true);
+    await runCli('-s=fetch-retry', 'close');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
 test('goto reports soft 404 as failure', async ({}) => {
   const server = http.createServer((req, res) => {
     res.writeHead(404, { 'content-type': 'text/html' });
