@@ -52,12 +52,15 @@ function extendHelp(help) {
     goto.flags.timeout = 'string';
     goto.flags['wait-until'] = 'string';
     goto.flags['retry-empty'] = 'boolean';
+    goto.flags['retry-empty-delay'] = 'string';
     if (!goto.help.includes('--timeout'))
       goto.help += '\n  --timeout                   navigation timeout in seconds';
     if (!goto.help.includes('--wait-until'))
       goto.help += '\n  --wait-until                navigation wait strategy: load, domcontentloaded, networkidle, commit';
     if (!goto.help.includes('--retry-empty'))
-      goto.help += '\n  --retry-empty               reload once if the page body is empty (JS-heavy sites)';
+      goto.help += '\n  --retry-empty               wait and reload once if the page body is empty (JS-heavy sites)';
+    if (!goto.help.includes('--retry-empty-delay'))
+      goto.help += '\n  --retry-empty-delay=<ms>    delay before retrying an empty body (default 1500)';
   }
 
   const evaluate = help.commands?.eval;
@@ -299,6 +302,7 @@ function prepareCommandArgs(args) {
     const hasTimeout = prepared.timeout !== undefined;
     const hasWaitUntil = prepared['wait-until'] !== undefined;
     const retryEmpty = prepared['retry-empty'] === true;
+    const retryDelayMs = prepared['retry-empty-delay'] !== undefined ? parseTimeoutMs(prepared['retry-empty-delay']) : 1500;
     if (hasTimeout || hasWaitUntil || retryEmpty) {
       const url = prepared._[1];
       if (typeof url !== 'string' || !url)
@@ -310,6 +314,7 @@ function prepareCommandArgs(args) {
       delete prepared.timeout;
       delete prepared['wait-until'];
       delete prepared['retry-empty'];
+      delete prepared['retry-empty-delay'];
       prepared._ = ['run-code', `async (page) => {
   const detectChallenge = async (status, title) => {
     const text = (title || '') + ' ' + (await page.evaluate(() => document.body ? document.body.innerText.slice(0, 2000) : '').catch(() => ''));
@@ -341,9 +346,13 @@ function prepareCommandArgs(args) {
   let bodyLength = await page.evaluate(() => document.body ? document.body.innerText.length : 0);
   let retried = false;
   if (${retryEmpty} && bodyLength === 0) {
-    await page.reload({ waitUntil: '${waitUntil}', timeout: ${timeoutMs} });
+    await page.waitForTimeout(${retryDelayMs});
     bodyLength = await page.evaluate(() => document.body ? document.body.innerText.length : 0);
-    retried = true;
+    if (bodyLength === 0) {
+      await page.reload({ waitUntil: '${waitUntil}', timeout: ${timeoutMs} });
+      bodyLength = await page.evaluate(() => document.body ? document.body.innerText.length : 0);
+      retried = true;
+    }
   }
   return {
     navigation: 'succeeded',
