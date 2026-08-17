@@ -678,6 +678,23 @@ test('fetch detects anti-bot challenge types from status and body', async ({}) =
   }
 });
 
+test('goto detects captcha widgets in the DOM (turnstile/recaptcha/hcaptcha)', async ({}) => {
+  await runCli('-s=captcha-widget', 'open', 'data:text/html,<title>s</title>');
+
+  const turnstile = await runCli('-s=captcha-widget', 'goto', 'data:text/html,<iframe src="https://challenges.cloudflare.com/turnstile/v0/api.js"></iframe>', '--timeout=5', '--json');
+  expect(JSON.parse(turnstile.output).result.challenge).toEqual({ type: 'turnstile', blocked: true });
+
+  const recaptcha = await runCli('-s=captcha-widget', 'goto', 'data:text/html,<div class="g-recaptcha" data-sitekey="test"></div>', '--timeout=5', '--json');
+  expect(JSON.parse(recaptcha.output).result.challenge).toEqual({ type: 'recaptcha', blocked: true });
+
+  const hcaptcha = await runCli('-s=captcha-widget', 'goto', 'data:text/html,<iframe src="https://hcaptcha.com/captcha/v2/api.js"></iframe>', '--timeout=5', '--json');
+  expect(JSON.parse(hcaptcha.output).result.challenge).toEqual({ type: 'hcaptcha', blocked: true });
+
+  const plain = await runCli('-s=captcha-widget', 'goto', 'data:text/html,<p>hello</p>', '--timeout=5', '--json');
+  expect(JSON.parse(plain.output).result.challenge).toEqual({ type: 'none', blocked: false });
+  await runCli('-s=captcha-widget', 'close');
+});
+
 test('goto reports soft 404 as failure', async ({}) => {
   const server = http.createServer((req, res) => {
     res.writeHead(404, { 'content-type': 'text/html' });

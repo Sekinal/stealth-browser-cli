@@ -323,6 +323,17 @@ function prepareCommandArgs(args) {
       delete prepared['retry-delay'];
       prepared._ = ['run-code', `async (page) => {
   const detectChallenge = async (status, title) => {
+    const dom = await page.evaluate(() => {
+      const has = (sel) => !!document.querySelector(sel);
+      return {
+        turnstile: has('iframe[src*="challenges.cloudflare.com"], .cf-turnstile, [data-turnstile-widget]'),
+        recaptcha: has('iframe[src*="recaptcha"], .g-recaptcha, [class*="g-recaptcha"], [data-sitekey]'),
+        hcaptcha: has('iframe[src*="hcaptcha.com"], .h-captcha'),
+      };
+    }).catch(() => ({ turnstile: false, recaptcha: false, hcaptcha: false }));
+    if (dom.turnstile) return { type: 'turnstile', blocked: true };
+    if (dom.recaptcha) return { type: 'recaptcha', blocked: true };
+    if (dom.hcaptcha) return { type: 'hcaptcha', blocked: true };
     const text = (title || '') + ' ' + (await page.evaluate(() => document.body ? document.body.innerText.slice(0, 2000) : '').catch(() => ''));
     const lower = text.toLowerCase();
     if (status === 403)
@@ -544,26 +555,36 @@ function readSessionContext(originalRun, session, clientInfo) {
 async function readPageMetadata(originalRun, session, clientInfo) {
   try {
     const response = await originalRun.call(session, clientInfo, {
-      _: ['eval', `() => ({
-        url: location.href,
-        title: document.title,
-        bodyLength: document.body ? document.body.innerText.length : 0,
-        bodyText: document.body ? document.body.innerText.slice(0, 2000) : '',
-        webdriver: navigator.webdriver,
-      })`],
+      _: ['eval', `() => {
+        const has = (sel) => !!document.querySelector(sel);
+        const captcha = {
+          turnstile: has('iframe[src*="challenges.cloudflare.com"], .cf-turnstile, [data-turnstile-widget]'),
+          recaptcha: has('iframe[src*="recaptcha"], .g-recaptcha, [class*="g-recaptcha"], [data-sitekey]'),
+          hcaptcha: has('iframe[src*="hcaptcha.com"], .h-captcha'),
+        };
+        return {
+          url: location.href,
+          title: document.title,
+          bodyLength: document.body ? document.body.innerText.length : 0,
+          bodyText: document.body ? document.body.innerText.slice(0, 2000) : '',
+          webdriver: navigator.webdriver,
+          captcha,
+        };
+      }`],
     }, { json: true, raw: false });
     const payload = normalizeUpstreamResult(parseJsonText(response.text));
     if (payload && typeof payload === 'object') {
       const title = stringOrNull(payload.title);
       const bodyText = stringOrNull(payload.bodyText) ?? '';
       const bodyLength = typeof payload.bodyLength === 'number' ? payload.bodyLength : null;
+      const challenge = detectCaptchaChallenge(title, bodyText, payload.captcha);
       return {
         url: stringOrNull(payload.url),
         title,
         bodyLength,
         emptyBody: bodyLength === 0,
         webdriver: !!payload.webdriver,
-        challenge: detectChallengeFromText(title, bodyText),
+        challenge,
       };
     }
   } catch {
@@ -812,6 +833,27 @@ function detectChallengeFromText(title, bodyText, status) {
   if (status === 429)
     return { type: 'rate-limit', blocked: true };
   return { type: 'none', blocked: false };
+}
+
+/**
+ * Detect a captcha challenge from DOM widget presence plus text signals.
+ * Prefers the precise widget type (turnstile/recaptcha/hcaptcha) from the
+ * browser DOM, falling back to text/keyword matching when the widget is not
+ * directly observable (e.g. the challenge is inside a cross-origin iframe).
+ *
+ * @param {string | null} title
+ * @param {string} bodyText
+ * @param {{ turnstile?: boolean, recaptcha?: boolean, hcaptcha?: boolean } | undefined} captcha
+ * @param {number | null} [status]
+ */
+function detectCaptchaChallenge(title, bodyText, captcha, status) {
+  if (captcha?.turnstile)
+    return { type: 'turnstile', blocked: true };
+  if (captcha?.recaptcha)
+    return { type: 'recaptcha', blocked: true };
+  if (captcha?.hcaptcha)
+    return { type: 'hcaptcha', blocked: true };
+  return detectChallengeFromText(title, bodyText, status);
 }
 
 /**
