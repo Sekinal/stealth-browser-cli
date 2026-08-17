@@ -79,6 +79,12 @@ function extendHelp(help) {
       snapshot.help += '\n  --inline                    return the snapshot inline instead of writing a file';
   }
 
+  const screenshot = help.commands?.screenshot;
+  if (screenshot) {
+    screenshot.flags.inline = 'boolean';
+    if (!screenshot.help.includes('--inline'))
+      screenshot.help += '\n  --inline                    return the screenshot as base64 PNG instead of writing a file';
+  }
   if (!help.commands.fetch) {
     help.commands.fetch = {
       flags: { method: 'string', data: 'string', header: 'string', timeout: 'string', user: 'string', password: 'string', retry: 'string' },
@@ -312,6 +318,20 @@ function prepareCommandArgs(args) {
     delete prepared.inline;
   }
 
+  if (command === 'screenshot' && prepared.inline) {
+    if (prepared.filename !== undefined)
+      throw new Error('Only one of --filename and --inline may be specified.');
+    const target = prepared._[1];
+    const fullPage = prepared['full-page'] === true;
+    delete prepared.inline;
+    delete prepared['full-page'];
+    prepared._ = ['run-code', `async (page) => {
+  const buf = ${target !== undefined
+    ? `await page.locator(${JSON.stringify(target)}).screenshot()`
+    : `await page.screenshot({ ${fullPage ? 'fullPage: true' : ''} })`};
+  return { screenshot: buf.toString('base64'), mimeType: 'image/png' };
+}`];
+  }
   if (command === 'goto') {
     const hasTimeout = prepared.timeout !== undefined;
     const hasWaitUntil = prepared['wait-until'] !== undefined;
@@ -418,6 +438,8 @@ function prepareCommandArgs(args) {
     const url = prepared._[1];
     if (typeof url !== 'string' || !url)
       throw new Error('fetch requires a URL (for example, fetch https://api.example.com/data).');
+    if (!/^(https?|data|about|blob):/i.test(url))
+      throw new Error(`Invalid URL '${url}': missing protocol. Use http://, https://, data:, about:, or blob:.`);
     const method = (prepared.method ?? 'GET').toUpperCase();
     if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD'].includes(method))
       throw new Error(`Unsupported fetch method '${prepared.method}'. Expected one of: GET, POST, PUT, PATCH, DELETE, HEAD.`);
@@ -451,6 +473,7 @@ function prepareCommandArgs(args) {
     ].filter(Boolean).join(', ');
     const maxAttempts = retryCount + 1;
     prepared._ = ['run-code', `async (page) => {
+  const startedAt = Date.now();
   const url = ${JSON.stringify(url)};
   const isSpecialScheme = /^(data|about|blob):/.test(url);
   if (isSpecialScheme) {
@@ -507,6 +530,7 @@ function prepareCommandArgs(args) {
     body,
     attempts,
     retried: attempts > 1,
+    durationMs: Date.now() - startedAt,
     ...(binary ? { binary: true } : {}),
     ...(json !== null ? { json } : {}),
     failed: status >= 400,

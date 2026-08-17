@@ -772,6 +772,22 @@ test('fetch --retry retries transient 5xx', async ({}) => {
   }
 });
 
+test('fetch rejects malformed URL with a clear message', async ({}) => {
+  const { prepareCommandArgs } = require('../cliEnhancements');
+  expect(() => prepareCommandArgs({ _: ['fetch', 'notaurl'] }))
+      .toThrow(/Invalid URL 'notaurl': missing protocol/);
+});
+
+test('screenshot --inline returns base64 PNG', async ({}) => {
+  await runCli('-s=screenshot-inline', 'open', 'data:text/html,<h1>Visual</h1>');
+  const result = await runCli('-s=screenshot-inline', 'screenshot', '--inline', '--json');
+  const payload = JSON.parse(result.output);
+  expect(payload.result.mimeType).toBe('image/png');
+  const buf = Buffer.from(payload.result.screenshot, 'base64');
+  expect(buf.slice(0, 8)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  await runCli('-s=screenshot-inline', 'close');
+});
+
 test('goto reports soft 404 as failure', async ({}) => {
   const server = http.createServer((req, res) => {
     res.writeHead(404, { 'content-type': 'text/html' });
