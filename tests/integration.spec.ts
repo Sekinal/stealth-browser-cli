@@ -677,6 +677,324 @@ test('fetch detects anti-bot challenge types from status and body', async ({}) =
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
 });
+
+test('goto detects captcha widgets in the DOM (turnstile/recaptcha/hcaptcha)', async ({}) => {
+  await runCli('-s=captcha-widget', 'open', 'data:text/html,<title>s</title>');
+
+  const turnstile = await runCli('-s=captcha-widget', 'goto', 'data:text/html,<iframe src="https://challenges.cloudflare.com/turnstile/v0/api.js"></iframe>', '--timeout=5', '--json');
+  expect(JSON.parse(turnstile.output).result.challenge).toEqual({ type: 'turnstile', blocked: true });
+
+  const recaptcha = await runCli('-s=captcha-widget', 'goto', 'data:text/html,<div class="g-recaptcha" data-sitekey="test"></div>', '--timeout=5', '--json');
+  expect(JSON.parse(recaptcha.output).result.challenge).toEqual({ type: 'recaptcha', blocked: true });
+
+  const hcaptcha = await runCli('-s=captcha-widget', 'goto', 'data:text/html,<iframe src="https://hcaptcha.com/captcha/v2/api.js"></iframe>', '--timeout=5', '--json');
+  expect(JSON.parse(hcaptcha.output).result.challenge).toEqual({ type: 'hcaptcha', blocked: true });
+
+  const plain = await runCli('-s=captcha-widget', 'goto', 'data:text/html,<p>hello</p>', '--timeout=5', '--json');
+  expect(JSON.parse(plain.output).result.challenge).toEqual({ type: 'none', blocked: false });
+  await runCli('-s=captcha-widget', 'close');
+});
+
+test('fetch supports basic auth via --user/--password', async ({}) => {
+  const server = http.createServer((req, res) => {
+    const auth = req.headers.authorization ?? '';
+    if (auth === `Basic ${Buffer.from('alice:secret').toString('base64')}`) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"authenticated":true}');
+    } else {
+      res.writeHead(401, { 'content-type': 'text/plain' });
+      res.end('unauthorized');
+    }
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string')
+    throw new Error('Expected a TCP server address');
+
+  try {
+    await runCli('-s=fetch-auth', 'open', 'data:text/html,<title>A</title>');
+    const result = await runCli('-s=fetch-auth', 'fetch', `http://127.0.0.1:${address.port}/`, '--user=alice', '--password=secret', '--json');
+    const payload = JSON.parse(result.output);
+    expect(payload.ok).toBe(true);
+    expect(payload.result.json.authenticated).toBe(true);
+    await runCli('-s=fetch-auth', 'close');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('wait-for waits for a selector or text to appear', async ({}) => {
+  await runCli('-s=wait-for-test', 'open', 'data:text/html,<h1>Welcome</h1>');
+  const found = await runCli('-s=wait-for-test', 'wait-for', 'text=Welcome', '--timeout=5', '--json');
+  expect(JSON.parse(found.output).result.found).toBe(true);
+
+  const missing = await runCli('-s=wait-for-test', 'wait-for', 'text=DefinitelyNotHere', '--timeout=1', '--json');
+  expect(JSON.parse(missing.output).result.found).toBe(false);
+  await runCli('-s=wait-for-test', 'close');
+});
+
+test('fetch --retry retries transient 5xx', async ({}) => {
+  let requests = 0;
+  const server = http.createServer((req, res) => {
+    requests++;
+    if (requests === 1) {
+      res.writeHead(503, { 'content-type': 'text/plain' });
+      res.end('overloaded');
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string')
+    throw new Error('Expected a TCP server address');
+
+  try {
+    await runCli('-s=fetch-retry', 'open', 'data:text/html,<title>R</title>');
+    const result = await runCli('-s=fetch-retry', 'fetch', `http://127.0.0.1:${address.port}/`, '--retry=2', '--json');
+    const payload = JSON.parse(result.output);
+    expect(payload.ok).toBe(true);
+    expect(payload.result.status).toBe(200);
+    expect(payload.result.attempts).toBe(2);
+    expect(payload.result.retried).toBe(true);
+    await runCli('-s=fetch-retry', 'close');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('fetch rejects malformed URL with a clear message', async ({}) => {
+  const { prepareCommandArgs } = require('../cliEnhancements');
+  expect(() => prepareCommandArgs({ _: ['fetch', 'notaurl'] }))
+      .toThrow(/Invalid URL 'notaurl': missing protocol/);
+});
+
+test('screenshot --inline returns base64 PNG', async ({}) => {
+  await runCli('-s=screenshot-inline', 'open', 'data:text/html,<h1>Visual</h1>');
+  const result = await runCli('-s=screenshot-inline', 'screenshot', '--inline', '--json');
+  const payload = JSON.parse(result.output);
+  expect(payload.result.mimeType).toBe('image/png');
+  const buf = Buffer.from(payload.result.screenshot, 'base64');
+  expect(buf.slice(0, 8)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  await runCli('-s=screenshot-inline', 'close');
+});
+
+test('solve-captcha detects, times out, and injects tokens', async ({}) => {
+  await runCli('-s=solve-captcha', 'open', 'data:text/html,<div class="cf-turnstile"></div><input name="cf-turnstile-response" value="">');
+
+  const noToken = await runCli('-s=solve-captcha', 'solve-captcha', '--timeout=1', '--json');
+  const noTokenPayload = JSON.parse(noToken.output).result;
+  expect(noTokenPayload.captcha).toBe('turnstile');
+  expect(noTokenPayload.solved).toBe(false);
+
+  const injected = await runCli('-s=solve-captcha', 'solve-captcha', '--token=abc123', '--json');
+  const injectedPayload = JSON.parse(injected.output).result;
+  expect(injectedPayload.captcha).toBe('turnstile');
+  expect(injectedPayload.solved).toBe(true);
+  expect(injectedPayload.injected).toBe(true);
+
+  await runCli('-s=solve-captcha', 'close');
+});
+
+test('solve-captcha integrates CapSolver (createTask/getTaskResult/token)', async ({}) => {
+  const solver = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', c => body += c);
+    req.on('end', () => {
+      let data = {};
+      try { data = JSON.parse(body || '{}'); } catch {}
+      res.writeHead(200, { 'content-type': 'application/json' });
+      if (req.url === '/createTask') {
+        res.end(JSON.stringify({ errorId: 0, taskId: 'mock-task' }));
+      } else if (req.url === '/getTaskResult') {
+        res.end(JSON.stringify({ errorId: 0, status: 'ready', solution: { token: 'mock-token-xyz' } }));
+      } else {
+        res.end(JSON.stringify({ errorId: 1, errorDescription: 'bad endpoint' }));
+      }
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    solver.once('error', reject);
+    solver.listen(0, '127.0.0.1', resolve);
+  });
+  const address = solver.address();
+  if (!address || typeof address === 'string')
+    throw new Error('Expected a TCP server address');
+
+  try {
+    await runCli('-s=capsolver-test', 'open', 'data:text/html,<div class="cf-turnstile" data-sitekey="0xTESTKEY"></div><input name="cf-turnstile-response">');
+    const result = await runCliWithOptions({
+      env: { CAPSOLVER_API_URL: `http://127.0.0.1:${address.port}` },
+    }, '-s=capsolver-test', 'solve-captcha', '--captcha-api-key=TEST', '--json');
+    const payload = JSON.parse(result.output).result;
+    expect(payload.captcha).toBe('turnstile');
+    expect(payload.solver).toBe('capsolver');
+    expect(payload.solved).toBe(true);
+    expect(payload.token).toBe('mock-token-xyz');
+    await runCli('-s=capsolver-test', 'close');
+  } finally {
+    solver.closeAllConnections();
+    await new Promise<void>(resolve => solver.close(() => resolve()));
+  }
+});
+
+test('solve-captcha auto-resolves via checkbox click in the iframe', async ({}) => {
+  const parent = `<!DOCTYPE html><html><head><title>Mock</title></head><body>
+<div class="cf-turnstile" data-sitekey="0xMOCK"></div>
+<input type="hidden" name="cf-turnstile-response" id="cf-turnstile-response" value="">
+<iframe id="w" src="/challenges.cloudflare.com/turnstile/iframe" style="width:300px;height:70px;border:none"></iframe>
+<script>
+window.addEventListener('message', (e) => { if (e.data && e.data.type === 'turnstile-token') document.getElementById('cf-turnstile-response').value = e.data.token; });
+</script>
+</body></html>`;
+  const iframe = `<!DOCTYPE html><html><body>
+<input type="checkbox" id="check" role="checkbox" style="width:24px;height:24px">
+<script>
+document.getElementById('check').addEventListener('change', (e) => {
+  if (e.target.checked) setTimeout(() => parent.postMessage({ type: 'turnstile-token', token: 'resolved-token-xyz' }, '*'), 100);
+});
+</script>
+</body></html>`;
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end(req.url.includes('/challenges.cloudflare.com/') ? iframe : parent);
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string')
+    throw new Error('Expected a TCP server address');
+
+  try {
+    await runCli('-s=turnstile-resolve', 'open', `http://127.0.0.1:${address.port}/`);
+    const result = await runCli('-s=turnstile-resolve', 'solve-captcha', '--timeout=10', '--json');
+    const payload = JSON.parse(result.output).result;
+    expect(payload.captcha).toBe('turnstile');
+    expect(payload.solved).toBe(true);
+    expect(payload.token).toBe('resolved-token-xyz');
+    await runCli('-s=turnstile-resolve', 'close');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('solve-captcha resolves press-and-hold challenges', async ({}) => {
+  const page = `<!DOCTYPE html><html><head><title>Verify</title></head><body>
+<button id="holdbtn" style="width:200px;height:60px">Press and Hold</button>
+<div id="status">not verified</div>
+<script>
+let t = null;
+const btn = document.getElementById('holdbtn');
+btn.addEventListener('mousedown', () => { t = setTimeout(() => {
+  document.getElementById('status').innerText = 'verified';
+  const inp = document.createElement('input');
+  inp.type = 'hidden'; inp.name = 'human-verification'; inp.value = 'human-verified-123';
+  document.body.appendChild(inp);
+}, 3000); });
+btn.addEventListener('mouseup', () => clearTimeout(t));
+btn.addEventListener('mouseleave', () => clearTimeout(t));
+</script></body></html>`;
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end(page);
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string')
+    throw new Error('Expected a TCP server address');
+
+  try {
+    await runCli('-s=press-hold', 'open', `http://127.0.0.1:${address.port}/`);
+    const result = await runCli('-s=press-hold', 'solve-captcha', '--timeout=15', '--json');
+    const payload = JSON.parse(result.output).result;
+    expect(payload.captcha).toBe('hold');
+    expect(payload.solved).toBe(true);
+    expect(payload.token).toBe('human-verified-123');
+    await runCli('-s=press-hold', 'close');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('goto reports soft 404 as failure', async ({}) => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(404, { 'content-type': 'text/html' });
+    res.end('<html><title>Not Found</title><body>Page not found</body></html>');
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string')
+    throw new Error('Expected a TCP server address');
+
+  try {
+    await runCli('-s=goto-soft404', 'open', 'data:text/html,<title>Start</title>');
+    const result = await runCli('-s=goto-soft404', 'goto', `http://127.0.0.1:${address.port}/`, '--timeout=5', '--json');
+    const payload = JSON.parse(result.output);
+    expect(payload.ok).toBe(false);
+    expect(payload.error).toContain('HTTP 404');
+    expect(payload.result.status).toBe(404);
+    expect(payload.result.failed).toBe(true);
+    await runCli('-s=goto-soft404', 'close');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('goto --retry retries transient 5xx and reports attempts', async ({}) => {
+  let requests = 0;
+  const server = http.createServer((req, res) => {
+    requests++;
+    if (requests === 1) {
+      res.writeHead(500, { 'content-type': 'text/plain' });
+      res.end('transient failure');
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<html><body>recovered</body></html>');
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string')
+    throw new Error('Expected a TCP server address');
+
+  try {
+    await runCli('-s=goto-retry', 'open', 'data:text/html,<title>Start</title>');
+    const result = await runCli('-s=goto-retry', 'goto', `http://127.0.0.1:${address.port}/`, '--timeout=5', '--retry=2', '--json');
+    const payload = JSON.parse(result.output);
+    expect(payload.ok).toBe(true);
+    expect(payload.result.status).toBe(200);
+    expect(payload.result.attempts).toBe(2);
+    expect(payload.result.retried).toBe(true);
+    expect(requests).toBe(2);
+    await runCli('-s=goto-retry', 'close');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
 test('fetch without URL reports missing argument', async ({}) => {
   const { prepareCommandArgs } = require('../cliEnhancements');
   expect(() => prepareCommandArgs({ _: ['fetch'] })).toThrow(/fetch requires a URL/);
@@ -794,9 +1112,9 @@ test('invalid --wait-until value is rejected', async ({}) => {
 
 test('goto --wait-until generates a run-code snippet with the right strategy', async ({}) => {
   const { prepareCommandArgs } = require('../cliEnhancements');
-  const prepared = prepareCommandArgs({ _: ['goto', 'https://example.com'], 'wait-until': 'networkidle2' });
+  const prepared = prepareCommandArgs({ _: ['goto', 'https://example.com'], 'wait-until': 'networkidle' });
   expect(prepared._[0]).toBe('run-code');
-  expect(prepared._[1]).toContain("waitUntil: 'networkidle2'");
+  expect(prepared._[1]).toContain("waitUntil: 'networkidle'");
   expect(prepared._[1]).toContain('navigation');
   expect(prepared._[1]).toContain('url: finalUrl');
   expect(prepared._[1]).toContain('status');
@@ -804,6 +1122,7 @@ test('goto --wait-until generates a run-code snippet with the right strategy', a
   expect(prepared._[1]).toContain('challenge');
   expect(prepared._[1]).toContain('bodyLength');
   expect(prepared._[1]).toContain('emptyBody');
+  expect(prepared._[1]).toContain('attempts');
 });
 
 test('goto without flags is not intercepted', async ({}) => {

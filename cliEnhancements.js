@@ -51,10 +51,18 @@ function extendHelp(help) {
   if (goto) {
     goto.flags.timeout = 'string';
     goto.flags['wait-until'] = 'string';
+    goto.flags['retry-empty'] = 'boolean';
+    goto.flags['retry-empty-delay'] = 'string';
+    goto.flags.retry = 'string';
+    goto.flags['retry-delay'] = 'string';
     if (!goto.help.includes('--timeout'))
       goto.help += '\n  --timeout                   navigation timeout in seconds';
     if (!goto.help.includes('--wait-until'))
-      goto.help += '\n  --wait-until                navigation wait strategy: load, domcontentloaded, networkidle0, networkidle2';
+      goto.help += '\n  --wait-until                navigation wait strategy: load, domcontentloaded, networkidle, commit';
+    if (!goto.help.includes('--retry'))
+      goto.help += '\n  --retry=<N>                 retry up to N times on transient failures (timeout, abort, empty body, 4xx)';
+    if (!goto.help.includes('--retry-delay'))
+      goto.help += '\n  --retry-delay=<ms>          delay between retries (default 1500)';
   }
 
   const evaluate = help.commands?.eval;
@@ -71,9 +79,15 @@ function extendHelp(help) {
       snapshot.help += '\n  --inline                    return the snapshot inline instead of writing a file';
   }
 
+  const screenshot = help.commands?.screenshot;
+  if (screenshot) {
+    screenshot.flags.inline = 'boolean';
+    if (!screenshot.help.includes('--inline'))
+      screenshot.help += '\n  --inline                    return the screenshot as base64 PNG instead of writing a file';
+  }
   if (!help.commands.fetch) {
     help.commands.fetch = {
-      flags: { method: 'string', data: 'string', header: 'string', timeout: 'string' },
+      flags: { method: 'string', data: 'string', header: 'string', timeout: 'string', user: 'string', password: 'string', retry: 'string' },
       args: ['url'],
       raw: true,
       help: [
@@ -81,7 +95,31 @@ function extendHelp(help) {
         '  --method=GET|POST|PUT|PATCH|DELETE|HEAD  HTTP method (default GET)',
         '  --data=<body>                            request body (POST/PUT/PATCH)',
         '  --header="Key: Value"                    request header (comma-separated)',
+        '  --user=<name> --password=<secret>        basic authentication',
         '  --timeout=<seconds>                      request timeout (default: no timeout)',
+        '  --retry=<N>                              retry up to N times on 5xx/network errors',
+      ].join('\n'),
+    };
+  }
+  if (!help.commands['wait-for']) {
+    help.commands['wait-for'] = {
+      flags: { timeout: 'string' },
+      args: ['selector'],
+      help: [
+        'playwright-cli wait-for <selector>      wait until an element matching a selector appears',
+        '  --timeout=<seconds>                     timeout (default 5)',
+      ].join('\n'),
+    };
+  }
+  if (!help.commands['solve-captcha']) {
+    help.commands['solve-captcha'] = {
+      flags: { timeout: 'string', token: 'string', 'captcha-api-key': 'string' },
+      args: [],
+      help: [
+        'playwright-cli solve-captcha             attempt to auto-solve the captcha on the page',
+        '  --timeout=<seconds>                     max wait for auto-resolution (default 15)',
+        '  --token=<token>                         inject a pre-solved token',
+        '  --captcha-api-key=<key>                 solve via CapSolver (or CAPSOLVER_API_KEY env)',
       ].join('\n'),
     };
   }
@@ -190,7 +228,7 @@ function patchSession(Session, options) {
         if (fetchChallenge.blocked)
           normalizedResult.challenge = fetchChallenge;
       }
-      if (cmd === 'fetch' && normalizedResult && typeof normalizedResult === 'object' && normalizedResult.failed) {
+      if ((cmd === 'fetch' || cmd === 'goto') && normalizedResult && typeof normalizedResult === 'object' && normalizedResult.failed) {
         const payload = {
           ...successPayload(page, null, consoleEntries, providerDetailsForSession(this, options.env), fallbackDetailsForSession(this, options.env), proxyDetails(options.env)),
           ok: false,
@@ -292,21 +330,54 @@ function prepareCommandArgs(args) {
     delete prepared.inline;
   }
 
+  if (command === 'screenshot' && prepared.inline) {
+    if (prepared.filename !== undefined)
+      throw new Error('Only one of --filename and --inline may be specified.');
+    const target = prepared._[1];
+    const fullPage = prepared['full-page'] === true;
+    delete prepared.inline;
+    delete prepared['full-page'];
+    prepared._ = ['run-code', `async (page) => {
+  const buf = ${target !== undefined
+    ? `await page.locator(${JSON.stringify(target)}).screenshot()`
+    : `await page.screenshot({ ${fullPage ? 'fullPage: true' : ''} })`};
+  return { screenshot: buf.toString('base64'), mimeType: 'image/png' };
+}`];
+  }
   if (command === 'goto') {
     const hasTimeout = prepared.timeout !== undefined;
     const hasWaitUntil = prepared['wait-until'] !== undefined;
-    if (hasTimeout || hasWaitUntil) {
+    const retryEmpty = prepared['retry-empty'] === true;
+    const retryCount = prepared.retry !== undefined ? Math.max(0, parseInt(prepared.retry, 10) || 0) : 0;
+    const retryDelayMs = prepared['retry-delay'] !== undefined ? parseTimeoutMs(prepared['retry-delay'])
+        : prepared['retry-empty-delay'] !== undefined ? parseTimeoutMs(prepared['retry-empty-delay']) : 1500;
+    if (hasTimeout || hasWaitUntil || retryEmpty || retryCount > 0) {
       const url = prepared._[1];
       if (typeof url !== 'string' || !url)
         throw new Error('goto requires a URL (for example, goto https://example.com --timeout=5).');
       const timeoutMs = hasTimeout ? parseTimeoutMs(prepared.timeout) : 60000;
       const waitUntil = hasWaitUntil ? prepared['wait-until'] : 'domcontentloaded';
-      if (hasWaitUntil && !['load', 'domcontentloaded', 'networkidle0', 'networkidle2'].includes(waitUntil))
-        throw new Error(`Invalid --wait-until value '${waitUntil}'. Expected one of: load, domcontentloaded, networkidle0, networkidle2.`);
+      if (hasWaitUntil && !['load', 'domcontentloaded', 'networkidle', 'commit'].includes(waitUntil))
+        throw new Error(`Invalid --wait-until value '${waitUntil}'. Expected one of: load, domcontentloaded, networkidle, commit.`);
       delete prepared.timeout;
       delete prepared['wait-until'];
+      delete prepared['retry-empty'];
+      delete prepared['retry-empty-delay'];
+      delete prepared.retry;
+      delete prepared['retry-delay'];
       prepared._ = ['run-code', `async (page) => {
   const detectChallenge = async (status, title) => {
+    const dom = await page.evaluate(() => {
+      const has = (sel) => !!document.querySelector(sel);
+      return {
+        turnstile: has('iframe[src*="challenges.cloudflare.com"], .cf-turnstile, [data-turnstile-widget]'),
+        recaptcha: has('iframe[src*="recaptcha"], .g-recaptcha, [class*="g-recaptcha"], [data-sitekey]'),
+        hcaptcha: has('iframe[src*="hcaptcha.com"], .h-captcha'),
+      };
+    }).catch(() => ({ turnstile: false, recaptcha: false, hcaptcha: false }));
+    if (dom.turnstile) return { type: 'turnstile', blocked: true };
+    if (dom.recaptcha) return { type: 'recaptcha', blocked: true };
+    if (dom.hcaptcha) return { type: 'hcaptcha', blocked: true };
     const text = (title || '') + ' ' + (await page.evaluate(() => document.body ? document.body.innerText.slice(0, 2000) : '').catch(() => ''));
     const lower = text.toLowerCase();
     if (status === 403)
@@ -321,19 +392,43 @@ function prepareCommandArgs(args) {
       return { type: 'datadome', blocked: true };
     if (lower.includes('access denied') || lower.includes('you have been blocked') || lower.includes('your access has been') || lower.includes("you don't have permission"))
       return { type: 'blocked', blocked: true };
-    if (lower.includes('captcha') || lower.includes('select all squares') || lower.includes('i am not a robot'))
+    if (lower.includes('select all squares') || lower.includes('i am not a robot') || lower.includes('verify you are human') || lower.includes('prove you are human') || lower.includes('complete the security check'))
       return { type: 'captcha', blocked: true };
     return { type: 'none', blocked: false };
   };
   const requestedUrl = ${JSON.stringify(url)};
-  const response = await page.goto(requestedUrl, { waitUntil: '${waitUntil}', timeout: ${timeoutMs} });
-  const finalUrl = page.url();
   const hostOf = (u) => { const m = u.match(/^[a-z][a-z0-9+.-]*:\\/\\/([^\\/?#]*)/i); return m ? m[1].toLowerCase() : u; };
+  const maxAttempts = ${retryCount} + 1;
+  let response = null;
+  let lastError = null;
+  let bodyLength = 0;
+  let attempts = 0;
+  for (let i = 0; i < maxAttempts; i++) {
+    attempts = i + 1;
+    try {
+      response = await page.goto(requestedUrl, { waitUntil: '${waitUntil}', timeout: ${timeoutMs} });
+      bodyLength = await page.evaluate(() => document.body ? document.body.innerText.length : 0);
+      lastError = null;
+    } catch (e) {
+      lastError = e;
+      bodyLength = 0;
+    }
+    const statusNow = response ? response.status() : null;
+    const retryOnEmpty = (${retryEmpty} || ${retryCount} > 0) && bodyLength === 0;
+    const retryOnError = ${retryCount} > 0 && lastError !== null;
+    const retryOnStatus = ${retryCount} > 0 && statusNow !== null && statusNow >= 400 && statusNow !== 404;
+    const shouldRetry = i < maxAttempts - 1 && (retryOnEmpty || retryOnError || retryOnStatus);
+    if (!shouldRetry)
+      break;
+    await page.waitForTimeout(${retryDelayMs});
+  }
+  if (lastError)
+    throw lastError;
+  const finalUrl = page.url();
   const redirected = hostOf(requestedUrl) !== hostOf(finalUrl);
   const title = await page.title();
   const status = response ? response.status() : null;
   const challenge = await detectChallenge(status, title);
-  const bodyLength = await page.evaluate(() => document.body ? document.body.innerText.length : 0);
   return {
     navigation: 'succeeded',
     url: finalUrl,
@@ -343,6 +438,9 @@ function prepareCommandArgs(args) {
     challenge,
     bodyLength,
     emptyBody: bodyLength === 0,
+    attempts,
+    retried: attempts > 1,
+    failed: status !== null && status >= 400,
   };
 }`];
     }
@@ -352,34 +450,70 @@ function prepareCommandArgs(args) {
     const url = prepared._[1];
     if (typeof url !== 'string' || !url)
       throw new Error('fetch requires a URL (for example, fetch https://api.example.com/data).');
+    if (!/^(https?|data|about|blob):/i.test(url))
+      throw new Error(`Invalid URL '${url}': missing protocol. Use http://, https://, data:, about:, or blob:.`);
     const method = (prepared.method ?? 'GET').toUpperCase();
     if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD'].includes(method))
       throw new Error(`Unsupported fetch method '${prepared.method}'. Expected one of: GET, POST, PUT, PATCH, DELETE, HEAD.`);
     const data = prepared.data;
     const headerArg = prepared.header;
     const timeoutMs = prepared.timeout !== undefined ? parseTimeoutMs(prepared.timeout) : undefined;
+    const retryCount = prepared.retry !== undefined ? Math.max(0, parseInt(prepared.retry, 10) || 0) : 0;
+    // Basic auth: build the Authorization header here (Node has Buffer) rather
+    // than in the sandbox, which lacks Node globals.
+    let authHeader = null;
+    if (prepared.user !== undefined || prepared.password !== undefined) {
+      const creds = Buffer.from(`${prepared.user ?? ''}:${prepared.password ?? ''}`).toString('base64');
+      authHeader = `Authorization: Basic ${creds}`;
+    }
     delete prepared.method;
     delete prepared.data;
     delete prepared.header;
     delete prepared.timeout;
+    delete prepared.retry;
+    delete prepared.user;
+    delete prepared.password;
+    const mergedHeaders = {
+      ...(headerArg !== undefined ? parseHeaderArg(headerArg) : {}),
+      ...(authHeader ? parseHeaderArg(authHeader) : {}),
+    };
+    const hasHeaders = Object.keys(mergedHeaders).length > 0;
     const requestOptions = [
       data !== undefined ? `data: ${JSON.stringify(data)}` : '',
-      headerArg !== undefined ? `headers: ${JSON.stringify(parseHeaderArg(headerArg))}` : '',
+      hasHeaders ? `headers: ${JSON.stringify(mergedHeaders)}` : '',
       timeoutMs !== undefined ? `timeout: ${timeoutMs}` : '',
     ].filter(Boolean).join(', ');
+    const maxAttempts = retryCount + 1;
     prepared._ = ['run-code', `async (page) => {
+  const startedAt = Date.now();
   const url = ${JSON.stringify(url)};
   const isSpecialScheme = /^(data|about|blob):/.test(url);
   if (isSpecialScheme) {
-    // APIRequestContext only supports http(s); fall back to in-page fetch for
-    // data:/about:/blob: URLs (same-origin, no CORS concern).
     const res = await page.evaluate(async (u) => {
       const r = await fetch(u);
       return { status: r.status, statusText: r.statusText, headers: Object.fromEntries(r.headers.entries()), body: await r.text() };
     }, url);
     return { ...res, url, redirected: false, failed: res.status >= 400 };
   }
-  const response = await page.request.${method.toLowerCase()}(url${requestOptions ? ', { ' + requestOptions + ' }' : ''});
+  let response = null;
+  let lastError = null;
+  let attempts = 0;
+  for (let i = 0; i < ${maxAttempts}; i++) {
+    attempts = i + 1;
+    try {
+      response = await page.request.${method.toLowerCase()}(url${requestOptions ? ', { ' + requestOptions + ' }' : ''});
+      lastError = null;
+    } catch (e) {
+      lastError = e;
+    }
+    const statusNow = response ? response.status() : null;
+    const shouldRetry = ${retryCount} > 0 && i < ${maxAttempts} - 1 && (lastError !== null || (statusNow !== null && statusNow >= 500));
+    if (!shouldRetry)
+      break;
+    await page.waitForTimeout(1500);
+  }
+  if (lastError && !response)
+    throw lastError;
   const status = response.status();
   const finalUrl = response.url();
   const redirected = url !== finalUrl;
@@ -406,10 +540,157 @@ function prepareCommandArgs(args) {
     redirected,
     headers,
     body,
+    attempts,
+    retried: attempts > 1,
+    durationMs: Date.now() - startedAt,
     ...(binary ? { binary: true } : {}),
     ...(json !== null ? { json } : {}),
     failed: status >= 400,
   };
+}`];
+  }
+
+  if (command === 'wait-for') {
+    const selector = prepared._[1];
+    if (typeof selector !== 'string' || !selector)
+      throw new Error('wait-for requires a selector (for example, wait-for "text=Submit" or "#main").');
+    const timeoutMs = prepared.timeout !== undefined ? parseTimeoutMs(prepared.timeout) : 5000;
+    delete prepared.timeout;
+    prepared._ = ['run-code', `async (page) => {
+  const target = ${JSON.stringify(selector)};
+  try {
+    const element = await page.waitForSelector(target, { timeout: ${timeoutMs} });
+    return {
+      found: true,
+      selector: target,
+      text: await element.textContent().catch(() => null),
+    };
+  } catch (e) {
+    return { found: false, selector: target, error: e.message };
+  }
+}`];
+  }
+
+  if (command === 'solve-captcha') {
+    const timeoutMs = prepared.timeout !== undefined ? parseTimeoutMs(prepared.timeout) : 15000;
+    const injectToken = prepared.token;
+    const apiKey = prepared['captcha-api-key'] ?? process.env.CAPSOLVER_API_KEY;
+    const useSolver = typeof apiKey === 'string' && apiKey.length > 0;
+    delete prepared.timeout;
+    delete prepared.token;
+    delete prepared['captcha-api-key'];
+    prepared._ = ['run-code', `async (page) => {
+  const detect = await page.evaluate(() => {
+    const q = (sel) => !!document.querySelector(sel);
+    const holdButton = [...document.querySelectorAll('button, [role="button"]')].some(el => /hold|press/i.test(el.textContent || ''));
+    return {
+      turnstile: q('.cf-turnstile, [data-turnstile-widget], iframe[src*="challenges.cloudflare.com"]'),
+      recaptcha: q('.g-recaptcha, iframe[src*="recaptcha"], iframe[title*="reCAPTCHA"]'),
+      hcaptcha: q('.h-captcha, iframe[src*="hcaptcha.com"]'),
+      hold: holdButton,
+    };
+  });
+  const type = detect.turnstile ? 'turnstile' : detect.recaptcha ? 'recaptcha' : detect.hcaptcha ? 'hcaptcha' : detect.hold ? 'hold' : 'none';
+  if (type === 'none')
+    return { captcha: 'none', solved: false, error: 'no captcha widget detected on the page' };
+  const tokenSelector = type === 'turnstile' ? '[name="cf-turnstile-response"]'
+    : type === 'recaptcha' ? '[name="g-recaptcha-response"], textarea[name="g-recaptcha-response"]'
+    : type === 'hcaptcha' ? '[name="h-captcha-response"], textarea[name="h-captcha-response"]'
+    : '[name*="verification"], [name*="human"], input[type="hidden"][name*="verify"]';
+  const inject = ${JSON.stringify(injectToken ?? null)};
+  if (inject) {
+    await page.evaluate((args) => {
+      const el = document.querySelector(args.sel);
+      if (el) { el.value = args.token; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); }
+    }, { sel: tokenSelector, token: inject });
+    return { captcha: type, solved: true, injected: true };
+  }
+  const solverKey = ${JSON.stringify(useSolver ? apiKey : null)};
+  const solverUrl = ${JSON.stringify(process.env.CAPSOLVER_API_URL || 'https://api.capsolver.com')};
+  if (solverKey) {
+    const sitekey = await page.evaluate(() => {
+      const el = document.querySelector('[data-sitekey], .cf-turnstile, .g-recaptcha, .h-captcha');
+      if (el && el.getAttribute('data-sitekey'))
+        return el.getAttribute('data-sitekey');
+      const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"], iframe[src*="recaptcha"], iframe[src*="hcaptcha"]');
+      if (iframe) {
+        const m = (iframe.src || '').match(/[?&]k=([^&]+)/);
+        if (m) return m[1];
+      }
+      return null;
+    });
+    if (!sitekey)
+      return { captcha: type, solved: false, error: 'could not extract the captcha sitekey' };
+    const taskType = type === 'turnstile' ? 'AntiTurnstileTaskProxyLess'
+      : type === 'recaptcha' ? 'ReCaptchaV2TaskProxyLess'
+      : 'HCaptchaTaskProxyLess';
+    try {
+      const createResp = await page.request.post(solverUrl + '/createTask', {
+        data: { clientKey: solverKey, task: { type: taskType, websiteURL: page.url(), websiteKey: sitekey } },
+      });
+      const createJson = await createResp.json();
+      if (createJson.errorId !== 0)
+        return { captcha: type, solved: false, solver: 'capsolver', error: createJson.errorDescription || createJson.errorCode };
+      const taskId = createJson.taskId;
+      for (let i = 0; i < 40; i++) {
+        const resResp = await page.request.post(solverUrl + '/getTaskResult', {
+          data: { clientKey: solverKey, taskId },
+        });
+        const resJson = await resResp.json();
+        if (resJson.errorId !== 0)
+          return { captcha: type, solved: false, solver: 'capsolver', error: resJson.errorDescription || resJson.errorCode };
+        if (resJson.status === 'ready') {
+          const token = resJson.solution?.token || resJson.solution?.gRecaptchaResponse;
+          if (token) {
+            await page.evaluate((args) => {
+              const el = document.querySelector(args.sel);
+              if (el) { el.value = args.token; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); }
+            }, { sel: tokenSelector, token });
+            return { captcha: type, solved: true, solver: 'capsolver', token };
+          }
+        }
+        await page.waitForTimeout(3000);
+      }
+      return { captcha: type, solved: false, solver: 'capsolver', error: 'CapSolver timed out waiting for the task result' };
+    } catch (e) {
+      return { captcha: type, solved: false, solver: 'capsolver', error: e.message };
+    }
+  }
+  if (type === 'turnstile') {
+    try {
+      const frame = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
+      await frame.locator('input[type="checkbox"], [role="checkbox"], .chakra-checkbox, label').first().click({ timeout: 3000 });
+    } catch (_) {}
+  }
+  if (type === 'recaptcha') {
+    try {
+      await page.evaluate(() => {
+        const box = document.querySelector('.recaptcha-checkbox, iframe[title*="reCAPTCHA"]');
+        if (box) box.click();
+      });
+    } catch (_) {}
+  }
+  try {
+    const holdButton = page.locator('button:has-text("hold"), button:has-text("press"), [role="button"]:has-text("hold"), [role="button"]:has-text("press")').first();
+    const box = await holdButton.boundingBox({ timeout: 1000 }).catch(() => null);
+    if (box) {
+      await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+      await page.mouse.down();
+      await page.waitForTimeout(5000);
+      await page.mouse.up();
+    }
+  } catch (_) {}
+  const deadline = Date.now() + ${timeoutMs};
+  while (Date.now() < deadline) {
+    const token = await page.evaluate((sel) => {
+      const el = document.querySelector(sel);
+      return el && el.value ? el.value : '';
+    }, tokenSelector);
+    if (token)
+      return { captcha: type, solved: true, token };
+    await page.waitForTimeout(500);
+  }
+  return { captcha: type, solved: false, error: 'timed out waiting for the captcha to resolve' };
 }`];
   }
 
@@ -501,26 +782,36 @@ function readSessionContext(originalRun, session, clientInfo) {
 async function readPageMetadata(originalRun, session, clientInfo) {
   try {
     const response = await originalRun.call(session, clientInfo, {
-      _: ['eval', `() => ({
-        url: location.href,
-        title: document.title,
-        bodyLength: document.body ? document.body.innerText.length : 0,
-        bodyText: document.body ? document.body.innerText.slice(0, 2000) : '',
-        webdriver: navigator.webdriver,
-      })`],
+      _: ['eval', `() => {
+        const has = (sel) => !!document.querySelector(sel);
+        const captcha = {
+          turnstile: has('iframe[src*="challenges.cloudflare.com"], .cf-turnstile, [data-turnstile-widget]'),
+          recaptcha: has('iframe[src*="recaptcha"], .g-recaptcha, [class*="g-recaptcha"], [data-sitekey]'),
+          hcaptcha: has('iframe[src*="hcaptcha.com"], .h-captcha'),
+        };
+        return {
+          url: location.href,
+          title: document.title,
+          bodyLength: document.body ? document.body.innerText.length : 0,
+          bodyText: document.body ? document.body.innerText.slice(0, 2000) : '',
+          webdriver: navigator.webdriver,
+          captcha,
+        };
+      }`],
     }, { json: true, raw: false });
     const payload = normalizeUpstreamResult(parseJsonText(response.text));
     if (payload && typeof payload === 'object') {
       const title = stringOrNull(payload.title);
       const bodyText = stringOrNull(payload.bodyText) ?? '';
       const bodyLength = typeof payload.bodyLength === 'number' ? payload.bodyLength : null;
+      const challenge = detectCaptchaChallenge(title, bodyText, payload.captcha);
       return {
         url: stringOrNull(payload.url),
         title,
         bodyLength,
         emptyBody: bodyLength === 0,
         webdriver: !!payload.webdriver,
-        challenge: detectChallengeFromText(title, bodyText),
+        challenge,
       };
     }
   } catch {
@@ -762,13 +1053,34 @@ function detectChallengeFromText(title, bodyText, status) {
     return { type: 'datadome', blocked: true };
   if (lower.includes('access denied') || lower.includes('you have been blocked') || lower.includes('your access has been') || lower.includes("you don't have permission"))
     return { type: 'blocked', blocked: true };
-  if (lower.includes('captcha') || lower.includes('select all squares') || lower.includes('i am not a robot'))
+  if (lower.includes('select all squares') || lower.includes('i am not a robot') || lower.includes('verify you are human') || lower.includes('prove you are human') || lower.includes('complete the security check'))
     return { type: 'captcha', blocked: true };
   if (status === 403)
     return { type: '403', blocked: true };
   if (status === 429)
     return { type: 'rate-limit', blocked: true };
   return { type: 'none', blocked: false };
+}
+
+/**
+ * Detect a captcha challenge from DOM widget presence plus text signals.
+ * Prefers the precise widget type (turnstile/recaptcha/hcaptcha) from the
+ * browser DOM, falling back to text/keyword matching when the widget is not
+ * directly observable (e.g. the challenge is inside a cross-origin iframe).
+ *
+ * @param {string | null} title
+ * @param {string} bodyText
+ * @param {{ turnstile?: boolean, recaptcha?: boolean, hcaptcha?: boolean } | undefined} captcha
+ * @param {number | null} [status]
+ */
+function detectCaptchaChallenge(title, bodyText, captcha, status) {
+  if (captcha?.turnstile)
+    return { type: 'turnstile', blocked: true };
+  if (captcha?.recaptcha)
+    return { type: 'recaptcha', blocked: true };
+  if (captcha?.hcaptcha)
+    return { type: 'hcaptcha', blocked: true };
+  return detectChallengeFromText(title, bodyText, status);
 }
 
 /**
