@@ -847,6 +847,49 @@ test('solve-captcha integrates CapSolver (createTask/getTaskResult/token)', asyn
   }
 });
 
+test('solve-captcha auto-resolves via checkbox click in the iframe', async ({}) => {
+  const parent = `<!DOCTYPE html><html><head><title>Mock</title></head><body>
+<div class="cf-turnstile" data-sitekey="0xMOCK"></div>
+<input type="hidden" name="cf-turnstile-response" id="cf-turnstile-response" value="">
+<iframe id="w" src="/challenges.cloudflare.com/turnstile/iframe" style="width:300px;height:70px;border:none"></iframe>
+<script>
+window.addEventListener('message', (e) => { if (e.data && e.data.type === 'turnstile-token') document.getElementById('cf-turnstile-response').value = e.data.token; });
+</script>
+</body></html>`;
+  const iframe = `<!DOCTYPE html><html><body>
+<input type="checkbox" id="check" role="checkbox" style="width:24px;height:24px">
+<script>
+document.getElementById('check').addEventListener('change', (e) => {
+  if (e.target.checked) setTimeout(() => parent.postMessage({ type: 'turnstile-token', token: 'resolved-token-xyz' }, '*'), 100);
+});
+</script>
+</body></html>`;
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end(req.url.includes('/challenges.cloudflare.com/') ? iframe : parent);
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string')
+    throw new Error('Expected a TCP server address');
+
+  try {
+    await runCli('-s=turnstile-resolve', 'open', `http://127.0.0.1:${address.port}/`);
+    const result = await runCli('-s=turnstile-resolve', 'solve-captcha', '--timeout=10', '--json');
+    const payload = JSON.parse(result.output).result;
+    expect(payload.captcha).toBe('turnstile');
+    expect(payload.solved).toBe(true);
+    expect(payload.token).toBe('resolved-token-xyz');
+    await runCli('-s=turnstile-resolve', 'close');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
 test('goto reports soft 404 as failure', async ({}) => {
   const server = http.createServer((req, res) => {
     res.writeHead(404, { 'content-type': 'text/html' });

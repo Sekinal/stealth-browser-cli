@@ -656,7 +656,7 @@ function prepareCommandArgs(args) {
   if (type === 'turnstile') {
     try {
       const frame = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
-      await frame.locator('body, input[type="checkbox"], [role="checkbox"], .chakra-checkbox').first().click({ timeout: 3000 });
+      await frame.locator('input[type="checkbox"], [role="checkbox"], .chakra-checkbox, label').first().click({ timeout: 3000 });
     } catch (_) {}
   }
   if (type === 'recaptcha') {
