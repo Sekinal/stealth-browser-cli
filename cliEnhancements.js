@@ -598,6 +598,14 @@ function prepareCommandArgs(args) {
     }, { sel: tokenSelector, token: inject });
     return { captcha: type, solved: true, injected: true };
   }
+  if (type === 'turnstile') {
+    // Managed mode shows a checkbox inside the challenges.cloudflare.com iframe.
+    // Click it to trigger the (possibly auto-passing) challenge.
+    try {
+      const frame = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
+      await frame.locator('body, input[type="checkbox"], [role="checkbox"], .chakra-checkbox').first().click({ timeout: 3000 });
+    } catch (_) {}
+  }
   if (type === 'recaptcha') {
     // Best-effort: click the checkbox to trigger the (possibly auto-passing) challenge.
     try {
@@ -607,6 +615,18 @@ function prepareCommandArgs(args) {
       });
     } catch (_) {}
   }
+  // Press-and-hold challenges (e.g. Walmart "press and hold"): hold the mouse
+  // button down on the button for a few seconds.
+  try {
+    const holdButton = page.locator('button:has-text("hold"), button:has-text("press"), [role="button"]:has-text("hold"), [role="button"]:has-text("press")').first();
+    const box = await holdButton.boundingBox({ timeout: 1000 }).catch(() => null);
+    if (box) {
+      await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+      await page.mouse.down();
+      await page.waitForTimeout(5000);
+      await page.mouse.up();
+    }
+  } catch (_) {}
   const deadline = Date.now() + ${timeoutMs};
   while (Date.now() < deadline) {
     const token = await page.evaluate((sel) => {
@@ -617,7 +637,7 @@ function prepareCommandArgs(args) {
       return { captcha: type, solved: true, token };
     await page.waitForTimeout(500);
   }
-  return { captcha: type, solved: false, error: 'timed out waiting for the captcha to auto-resolve (it may require human solving or a third-party solver token)' };
+  return { captcha: type, solved: false, error: 'timed out waiting for the captcha to resolve' };
 }`];
   }
 
