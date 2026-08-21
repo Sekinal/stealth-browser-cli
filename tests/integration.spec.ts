@@ -805,6 +805,48 @@ test('solve-captcha detects, times out, and injects tokens', async ({}) => {
   await runCli('-s=solve-captcha', 'close');
 });
 
+test('solve-captcha integrates CapSolver (createTask/getTaskResult/token)', async ({}) => {
+  const solver = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', c => body += c);
+    req.on('end', () => {
+      let data = {};
+      try { data = JSON.parse(body || '{}'); } catch {}
+      res.writeHead(200, { 'content-type': 'application/json' });
+      if (req.url === '/createTask') {
+        res.end(JSON.stringify({ errorId: 0, taskId: 'mock-task' }));
+      } else if (req.url === '/getTaskResult') {
+        res.end(JSON.stringify({ errorId: 0, status: 'ready', solution: { token: 'mock-token-xyz' } }));
+      } else {
+        res.end(JSON.stringify({ errorId: 1, errorDescription: 'bad endpoint' }));
+      }
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    solver.once('error', reject);
+    solver.listen(0, '127.0.0.1', resolve);
+  });
+  const address = solver.address();
+  if (!address || typeof address === 'string')
+    throw new Error('Expected a TCP server address');
+
+  try {
+    await runCli('-s=capsolver-test', 'open', 'data:text/html,<div class="cf-turnstile" data-sitekey="0xTESTKEY"></div><input name="cf-turnstile-response">');
+    const result = await runCliWithOptions({
+      env: { CAPSOLVER_API_URL: `http://127.0.0.1:${address.port}` },
+    }, '-s=capsolver-test', 'solve-captcha', '--captcha-api-key=TEST', '--json');
+    const payload = JSON.parse(result.output).result;
+    expect(payload.captcha).toBe('turnstile');
+    expect(payload.solver).toBe('capsolver');
+    expect(payload.solved).toBe(true);
+    expect(payload.token).toBe('mock-token-xyz');
+    await runCli('-s=capsolver-test', 'close');
+  } finally {
+    solver.closeAllConnections();
+    await new Promise<void>(resolve => solver.close(() => resolve()));
+  }
+});
+
 test('goto reports soft 404 as failure', async ({}) => {
   const server = http.createServer((req, res) => {
     res.writeHead(404, { 'content-type': 'text/html' });

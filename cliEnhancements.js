@@ -113,12 +113,13 @@ function extendHelp(help) {
   }
   if (!help.commands['solve-captcha']) {
     help.commands['solve-captcha'] = {
-      flags: { timeout: 'string', token: 'string' },
+      flags: { timeout: 'string', token: 'string', 'captcha-api-key': 'string' },
       args: [],
       help: [
         'playwright-cli solve-captcha             attempt to auto-solve the captcha on the page',
         '  --timeout=<seconds>                     max wait for auto-resolution (default 15)',
-        '  --token=<token>                         inject a pre-solved token (from a third-party solver)',
+        '  --token=<token>                         inject a pre-solved token',
+        '  --captcha-api-key=<key>                 solve via CapSolver (or CAPSOLVER_API_KEY env)',
       ].join('\n'),
     };
   }
@@ -573,8 +574,11 @@ function prepareCommandArgs(args) {
   if (command === 'solve-captcha') {
     const timeoutMs = prepared.timeout !== undefined ? parseTimeoutMs(prepared.timeout) : 15000;
     const injectToken = prepared.token;
+    const apiKey = prepared['captcha-api-key'] ?? process.env.CAPSOLVER_API_KEY;
+    const useSolver = typeof apiKey === 'string' && apiKey.length > 0;
     delete prepared.timeout;
     delete prepared.token;
+    delete prepared['captcha-api-key'];
     prepared._ = ['run-code', `async (page) => {
   const detect = await page.evaluate(() => {
     const q = (sel) => !!document.querySelector(sel);
@@ -598,16 +602,64 @@ function prepareCommandArgs(args) {
     }, { sel: tokenSelector, token: inject });
     return { captcha: type, solved: true, injected: true };
   }
+  const solverKey = ${JSON.stringify(useSolver ? apiKey : null)};
+  const solverUrl = ${JSON.stringify(process.env.CAPSOLVER_API_URL || 'https://api.capsolver.com')};
+  if (solverKey) {
+    const sitekey = await page.evaluate(() => {
+      const el = document.querySelector('[data-sitekey], .cf-turnstile, .g-recaptcha, .h-captcha');
+      if (el && el.getAttribute('data-sitekey'))
+        return el.getAttribute('data-sitekey');
+      const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"], iframe[src*="recaptcha"], iframe[src*="hcaptcha"]');
+      if (iframe) {
+        const m = (iframe.src || '').match(/[?&]k=([^&]+)/);
+        if (m) return m[1];
+      }
+      return null;
+    });
+    if (!sitekey)
+      return { captcha: type, solved: false, error: 'could not extract the captcha sitekey' };
+    const taskType = type === 'turnstile' ? 'AntiTurnstileTaskProxyLess'
+      : type === 'recaptcha' ? 'ReCaptchaV2TaskProxyLess'
+      : 'HCaptchaTaskProxyLess';
+    try {
+      const createResp = await page.request.post(solverUrl + '/createTask', {
+        data: { clientKey: solverKey, task: { type: taskType, websiteURL: page.url(), websiteKey: sitekey } },
+      });
+      const createJson = await createResp.json();
+      if (createJson.errorId !== 0)
+        return { captcha: type, solved: false, solver: 'capsolver', error: createJson.errorDescription || createJson.errorCode };
+      const taskId = createJson.taskId;
+      for (let i = 0; i < 40; i++) {
+        const resResp = await page.request.post(solverUrl + '/getTaskResult', {
+          data: { clientKey: solverKey, taskId },
+        });
+        const resJson = await resResp.json();
+        if (resJson.errorId !== 0)
+          return { captcha: type, solved: false, solver: 'capsolver', error: resJson.errorDescription || resJson.errorCode };
+        if (resJson.status === 'ready') {
+          const token = resJson.solution?.token || resJson.solution?.gRecaptchaResponse;
+          if (token) {
+            await page.evaluate((args) => {
+              const el = document.querySelector(args.sel);
+              if (el) { el.value = args.token; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); }
+            }, { sel: tokenSelector, token });
+            return { captcha: type, solved: true, solver: 'capsolver', token };
+          }
+        }
+        await page.waitForTimeout(3000);
+      }
+      return { captcha: type, solved: false, solver: 'capsolver', error: 'CapSolver timed out waiting for the task result' };
+    } catch (e) {
+      return { captcha: type, solved: false, solver: 'capsolver', error: e.message };
+    }
+  }
   if (type === 'turnstile') {
-    // Managed mode shows a checkbox inside the challenges.cloudflare.com iframe.
-    // Click it to trigger the (possibly auto-passing) challenge.
     try {
       const frame = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
       await frame.locator('body, input[type="checkbox"], [role="checkbox"], .chakra-checkbox').first().click({ timeout: 3000 });
     } catch (_) {}
   }
   if (type === 'recaptcha') {
-    // Best-effort: click the checkbox to trigger the (possibly auto-passing) challenge.
     try {
       await page.evaluate(() => {
         const box = document.querySelector('.recaptcha-checkbox, iframe[title*="reCAPTCHA"]');
@@ -615,8 +667,6 @@ function prepareCommandArgs(args) {
       });
     } catch (_) {}
   }
-  // Press-and-hold challenges (e.g. Walmart "press and hold"): hold the mouse
-  // button down on the button for a few seconds.
   try {
     const holdButton = page.locator('button:has-text("hold"), button:has-text("press"), [role="button"]:has-text("hold"), [role="button"]:has-text("press")').first();
     const box = await holdButton.boundingBox({ timeout: 1000 }).catch(() => null);
