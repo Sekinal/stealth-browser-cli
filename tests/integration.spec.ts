@@ -890,6 +890,48 @@ document.getElementById('check').addEventListener('change', (e) => {
   }
 });
 
+test('solve-captcha resolves press-and-hold challenges', async ({}) => {
+  const page = `<!DOCTYPE html><html><head><title>Verify</title></head><body>
+<button id="holdbtn" style="width:200px;height:60px">Press and Hold</button>
+<div id="status">not verified</div>
+<script>
+let t = null;
+const btn = document.getElementById('holdbtn');
+btn.addEventListener('mousedown', () => { t = setTimeout(() => {
+  document.getElementById('status').innerText = 'verified';
+  const inp = document.createElement('input');
+  inp.type = 'hidden'; inp.name = 'human-verification'; inp.value = 'human-verified-123';
+  document.body.appendChild(inp);
+}, 3000); });
+btn.addEventListener('mouseup', () => clearTimeout(t));
+btn.addEventListener('mouseleave', () => clearTimeout(t));
+</script></body></html>`;
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end(page);
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string')
+    throw new Error('Expected a TCP server address');
+
+  try {
+    await runCli('-s=press-hold', 'open', `http://127.0.0.1:${address.port}/`);
+    const result = await runCli('-s=press-hold', 'solve-captcha', '--timeout=15', '--json');
+    const payload = JSON.parse(result.output).result;
+    expect(payload.captcha).toBe('hold');
+    expect(payload.solved).toBe(true);
+    expect(payload.token).toBe('human-verified-123');
+    await runCli('-s=press-hold', 'close');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
 test('goto reports soft 404 as failure', async ({}) => {
   const server = http.createServer((req, res) => {
     res.writeHead(404, { 'content-type': 'text/html' });

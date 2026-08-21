@@ -582,18 +582,21 @@ function prepareCommandArgs(args) {
     prepared._ = ['run-code', `async (page) => {
   const detect = await page.evaluate(() => {
     const q = (sel) => !!document.querySelector(sel);
+    const holdButton = [...document.querySelectorAll('button, [role="button"]')].some(el => /hold|press/i.test(el.textContent || ''));
     return {
       turnstile: q('.cf-turnstile, [data-turnstile-widget], iframe[src*="challenges.cloudflare.com"]'),
       recaptcha: q('.g-recaptcha, iframe[src*="recaptcha"], iframe[title*="reCAPTCHA"]'),
       hcaptcha: q('.h-captcha, iframe[src*="hcaptcha.com"]'),
+      hold: holdButton,
     };
   });
-  const type = detect.turnstile ? 'turnstile' : detect.recaptcha ? 'recaptcha' : detect.hcaptcha ? 'hcaptcha' : 'none';
+  const type = detect.turnstile ? 'turnstile' : detect.recaptcha ? 'recaptcha' : detect.hcaptcha ? 'hcaptcha' : detect.hold ? 'hold' : 'none';
   if (type === 'none')
     return { captcha: 'none', solved: false, error: 'no captcha widget detected on the page' };
   const tokenSelector = type === 'turnstile' ? '[name="cf-turnstile-response"]'
     : type === 'recaptcha' ? '[name="g-recaptcha-response"], textarea[name="g-recaptcha-response"]'
-    : '[name="h-captcha-response"], textarea[name="h-captcha-response"]';
+    : type === 'hcaptcha' ? '[name="h-captcha-response"], textarea[name="h-captcha-response"]'
+    : '[name*="verification"], [name*="human"], input[type="hidden"][name*="verify"]';
   const inject = ${JSON.stringify(injectToken ?? null)};
   if (inject) {
     await page.evaluate((args) => {
