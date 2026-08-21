@@ -788,6 +788,23 @@ test('screenshot --inline returns base64 PNG', async ({}) => {
   await runCli('-s=screenshot-inline', 'close');
 });
 
+test('solve-captcha detects, times out, and injects tokens', async ({}) => {
+  await runCli('-s=solve-captcha', 'open', 'data:text/html,<div class="cf-turnstile"></div><input name="cf-turnstile-response" value="">');
+
+  const noToken = await runCli('-s=solve-captcha', 'solve-captcha', '--timeout=1', '--json');
+  const noTokenPayload = JSON.parse(noToken.output).result;
+  expect(noTokenPayload.captcha).toBe('turnstile');
+  expect(noTokenPayload.solved).toBe(false);
+
+  const injected = await runCli('-s=solve-captcha', 'solve-captcha', '--token=abc123', '--json');
+  const injectedPayload = JSON.parse(injected.output).result;
+  expect(injectedPayload.captcha).toBe('turnstile');
+  expect(injectedPayload.solved).toBe(true);
+  expect(injectedPayload.injected).toBe(true);
+
+  await runCli('-s=solve-captcha', 'close');
+});
+
 test('goto reports soft 404 as failure', async ({}) => {
   const server = http.createServer((req, res) => {
     res.writeHead(404, { 'content-type': 'text/html' });

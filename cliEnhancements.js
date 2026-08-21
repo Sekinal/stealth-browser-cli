@@ -111,6 +111,17 @@ function extendHelp(help) {
       ].join('\n'),
     };
   }
+  if (!help.commands['solve-captcha']) {
+    help.commands['solve-captcha'] = {
+      flags: { timeout: 'string', token: 'string' },
+      args: [],
+      help: [
+        'playwright-cli solve-captcha             attempt to auto-solve the captcha on the page',
+        '  --timeout=<seconds>                     max wait for auto-resolution (default 15)',
+        '  --token=<token>                         inject a pre-solved token (from a third-party solver)',
+      ].join('\n'),
+    };
+  }
 }
 
 /**
@@ -556,6 +567,57 @@ function prepareCommandArgs(args) {
   } catch (e) {
     return { found: false, selector: target, error: e.message };
   }
+}`];
+  }
+
+  if (command === 'solve-captcha') {
+    const timeoutMs = prepared.timeout !== undefined ? parseTimeoutMs(prepared.timeout) : 15000;
+    const injectToken = prepared.token;
+    delete prepared.timeout;
+    delete prepared.token;
+    prepared._ = ['run-code', `async (page) => {
+  const detect = await page.evaluate(() => {
+    const q = (sel) => !!document.querySelector(sel);
+    return {
+      turnstile: q('.cf-turnstile, [data-turnstile-widget], iframe[src*="challenges.cloudflare.com"]'),
+      recaptcha: q('.g-recaptcha, iframe[src*="recaptcha"], iframe[title*="reCAPTCHA"]'),
+      hcaptcha: q('.h-captcha, iframe[src*="hcaptcha.com"]'),
+    };
+  });
+  const type = detect.turnstile ? 'turnstile' : detect.recaptcha ? 'recaptcha' : detect.hcaptcha ? 'hcaptcha' : 'none';
+  if (type === 'none')
+    return { captcha: 'none', solved: false, error: 'no captcha widget detected on the page' };
+  const tokenSelector = type === 'turnstile' ? '[name="cf-turnstile-response"]'
+    : type === 'recaptcha' ? '[name="g-recaptcha-response"], textarea[name="g-recaptcha-response"]'
+    : '[name="h-captcha-response"], textarea[name="h-captcha-response"]';
+  const inject = ${JSON.stringify(injectToken ?? null)};
+  if (inject) {
+    await page.evaluate((args) => {
+      const el = document.querySelector(args.sel);
+      if (el) { el.value = args.token; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); }
+    }, { sel: tokenSelector, token: inject });
+    return { captcha: type, solved: true, injected: true };
+  }
+  if (type === 'recaptcha') {
+    // Best-effort: click the checkbox to trigger the (possibly auto-passing) challenge.
+    try {
+      await page.evaluate(() => {
+        const box = document.querySelector('.recaptcha-checkbox, iframe[title*="reCAPTCHA"]');
+        if (box) box.click();
+      });
+    } catch (_) {}
+  }
+  const deadline = Date.now() + ${timeoutMs};
+  while (Date.now() < deadline) {
+    const token = await page.evaluate((sel) => {
+      const el = document.querySelector(sel);
+      return el && el.value ? el.value : '';
+    }, tokenSelector);
+    if (token)
+      return { captcha: type, solved: true, token };
+    await page.waitForTimeout(500);
+  }
+  return { captcha: type, solved: false, error: 'timed out waiting for the captcha to auto-resolve (it may require human solving or a third-party solver token)' };
 }`];
   }
 
